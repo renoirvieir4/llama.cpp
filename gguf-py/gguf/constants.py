@@ -153,6 +153,14 @@ class Keys:
         INTERLEAVE_MOE_LAYER_STEP         = "{arch}.interleave_moe_layer_step"
         FULL_ATTENTION_INTERVAL           = "{arch}.full_attention_interval"
         NUM_LOOPS                         = "{arch}.num_loops"
+        INPUT_LAYER_COUNT                 = "{arch}.input_layer_count"
+        RECURRENT_LAYER_COUNT             = "{arch}.recurrent_layer_count"
+        OUTPUT_LAYER_COUNT                = "{arch}.output_layer_count"
+        RECURRENT_KV_CACHE_MODE            = "{arch}.recurrent_kv_cache_mode"
+        LAYER_PATTERN                     = "{arch}.layer_pattern"
+        INIT_STD                          = "{arch}.init_std"
+        ALPHA_INIT                        = "{arch}.alpha_init"
+        GATE_INIT                         = "{arch}.gate_init"
         SKIP_LOOP_FINAL_NORM              = "{arch}.skip_loop_final_norm"
         HASH_LAYER_COUNT                  = "{arch}.hash_layer_count"
         ACTIVATION_SPARSITY_SCALE         = "{arch}.activation_sparsity_scale"
@@ -274,6 +282,8 @@ class Keys:
         DIMENSION_SECTIONS        = "{arch}.rope.dimension_sections"
         SECTION_ORDER             = "{arch}.rope.section_order"
         FREQ_BASE                 = "{arch}.rope.freq_base"
+        FREQ_BASE_2               = "{arch}.rope.freq_base_2"
+        PROFILE                   = "{arch}.rope.profile"
         FREQ_BASE_SPATIAL         = "{arch}.rope.freq_base_spatial"
         FREQ_BASE_SWA             = "{arch}.rope.freq_base_swa"
         SCALING_TYPE              = "{arch}.rope.scaling.type"
@@ -566,6 +576,7 @@ class GGUFType:
 
 
 class MODEL_ARCH(IntEnum):
+    DORY             = auto()
     MMPROJ           = auto() # dummy arch for clip.cpp
     LLAMA            = auto()
     LLAMA4           = auto()
@@ -603,10 +614,12 @@ class MODEL_ARCH(IntEnum):
     BEAM             = auto()
     QWEN3VL          = auto()
     QWEN3VLMOE       = auto()
+    SENSENOVA_LOOP   = auto()
     QWEN35           = auto()
     QWEN35MOE        = auto()
     CLEF             = auto()
     VLLM_DECISION2   = auto()
+    CLOVER_MOE       = auto()
     QWEN4EXP         = auto()
     PHI2             = auto()
     PHI3             = auto()
@@ -749,6 +762,12 @@ class VISION_PROJECTOR_TYPE(IntEnum):
 
 
 class MODEL_TENSOR(IntEnum):
+    RESIDUAL_ALPHA       = auto()
+    ATTN_QK_SCALE        = auto()
+    ATTN_GATE_SCALE      = auto()
+    FFN_GATE_SCALE       = auto()
+    FFN_UP_SCALE         = auto()
+    OUTPUT_SCALE         = auto()
     TOKEN_EMBD           = auto()
     TOKEN_EMBD_NORM      = auto()
     MASKED_EMBD_CENTROIDS= auto()
@@ -839,6 +858,8 @@ class MODEL_TENSOR(IntEnum):
     LAUREL_POST_NORM     = auto() # gemma3n
     SSM_IN               = auto()
     SSM_CONV1D           = auto()
+    SSM_BD_LOGIT_SCALE   = auto() # clover: per-head preview Q/K score scale
+    SSM_BD_HISTORY       = auto() # clover: history logit coefficient (.weight) and offset (.bias)
     SSM_X                = auto()
     SSM_DT               = auto()
     SSM_DT_NORM          = auto()
@@ -1412,6 +1433,7 @@ class MODEL_TENSOR(IntEnum):
 
 
 MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+    MODEL_ARCH.DORY: "dory",
     MODEL_ARCH.MMPROJ:           "clip", # dummy arch for clip.cpp
     MODEL_ARCH.LLAMA:            "llama",
     MODEL_ARCH.LLAMA4:           "llama4",
@@ -1448,10 +1470,12 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.BEAM:             "beam",
     MODEL_ARCH.QWEN3VL:          "qwen3vl",
     MODEL_ARCH.QWEN3VLMOE:       "qwen3vlmoe",
+    MODEL_ARCH.SENSENOVA_LOOP:   "sensenova_loop",
     MODEL_ARCH.QWEN35:           "qwen35",
     MODEL_ARCH.QWEN35MOE:        "qwen35moe",
     MODEL_ARCH.CLEF:             "clef",
     MODEL_ARCH.VLLM_DECISION2:   "vllm-decision2",
+    MODEL_ARCH.CLOVER_MOE:       "clover_moe",
     MODEL_ARCH.QWEN4EXP:         "qwen4exp",
     MODEL_ARCH.PHI2:             "phi2",
     MODEL_ARCH.PHI3:             "phi3",
@@ -1593,6 +1617,12 @@ VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
 }
 
 TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+    MODEL_TENSOR.RESIDUAL_ALPHA:            "blk.{bid}.residual_alpha",
+    MODEL_TENSOR.ATTN_QK_SCALE:             "blk.{bid}.attn_qk_scale",
+    MODEL_TENSOR.ATTN_GATE_SCALE:           "blk.{bid}.attn_gate_scale",
+    MODEL_TENSOR.FFN_GATE_SCALE:            "blk.{bid}.ffn_gate_scale",
+    MODEL_TENSOR.FFN_UP_SCALE:              "blk.{bid}.ffn_up_scale",
+    MODEL_TENSOR.OUTPUT_SCALE:              "output_scale",
     MODEL_TENSOR.TOKEN_EMBD:                "token_embd",
     MODEL_TENSOR.TOKEN_EMBD_NORM:           "token_embd_norm",
     MODEL_TENSOR.TOKEN_TYPES:               "token_types",
@@ -1683,6 +1713,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.LAUREL_POST_NORM:          "blk.{bid}.laurel_post_norm",     # gemma3n
     MODEL_TENSOR.SSM_IN:                    "blk.{bid}.ssm_in",
     MODEL_TENSOR.SSM_CONV1D:                "blk.{bid}.ssm_conv1d",
+    MODEL_TENSOR.SSM_BD_LOGIT_SCALE:        "blk.{bid}.ssm_bd_logit_scale",
+    MODEL_TENSOR.SSM_BD_HISTORY:            "blk.{bid}.ssm_bd_history",
     MODEL_TENSOR.SSM_X:                     "blk.{bid}.ssm_x",
     MODEL_TENSOR.SSM_DT:                    "blk.{bid}.ssm_dt",
     MODEL_TENSOR.SSM_DT_NORM:               "blk.{bid}.ssm_dt_norm",
@@ -2249,6 +2281,14 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+    MODEL_ARCH.DORY: [
+        MODEL_TENSOR.TOKEN_EMBD, MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_Q, MODEL_TENSOR.ATTN_K, MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT, MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.FFN_GATE, MODEL_TENSOR.FFN_UP, MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.RESIDUAL_ALPHA, MODEL_TENSOR.ATTN_QK_SCALE, MODEL_TENSOR.ATTN_GATE_SCALE,
+        MODEL_TENSOR.FFN_GATE_SCALE, MODEL_TENSOR.FFN_UP_SCALE, MODEL_TENSOR.OUTPUT_SCALE,
+    ],
     MODEL_ARCH.MMPROJ: [
         MODEL_TENSOR.V_MMPROJ,
         MODEL_TENSOR.V_MMPROJ_FC,
@@ -3348,6 +3388,39 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_HNORM,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+    ],
+    MODEL_ARCH.CLOVER_MOE: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_INP_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_GATE_UP_EXP,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_CONV1D,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_NORM,
+        MODEL_TENSOR.SSM_BETA,
+        MODEL_TENSOR.SSM_ALPHA,
+        MODEL_TENSOR.SSM_OUT,
+        MODEL_TENSOR.SSM_BD_LOGIT_SCALE,
+        MODEL_TENSOR.SSM_BD_HISTORY,
     ],
     MODEL_ARCH.QWEN4EXP: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -6747,3 +6820,7 @@ KEY_TOKENIZER_FIM_SEP_ID = Keys.Tokenizer.FIM_SEP_ID
 KEY_TOKENIZER_PREFIX_ID  = Keys.Tokenizer.PREFIX_ID
 KEY_TOKENIZER_SUFFIX_ID  = Keys.Tokenizer.SUFFIX_ID
 KEY_TOKENIZER_MIDDLE_ID  = Keys.Tokenizer.MIDDLE_ID
+
+MODEL_TENSORS[MODEL_ARCH.SENSENOVA_LOOP] = MODEL_TENSORS[MODEL_ARCH.QWEN35] + [
+    MODEL_TENSOR.HC_ATTN_FN, MODEL_TENSOR.HC_ATTN_BASE, MODEL_TENSOR.HC_FFN_FN, MODEL_TENSOR.HC_FFN_BASE,
+]

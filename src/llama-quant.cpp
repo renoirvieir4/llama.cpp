@@ -340,6 +340,9 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // do not quantize Mamba/Kimi's small conv1d weights
     // NOTE: can't use LLM_TN here because the layer number is not known
     quantize &= name.find("ssm_conv1d") == std::string::npos;
+    if (arch == LLM_ARCH_SENSENOVA_LOOP) {
+        quantize &= name.find(".hc_") == std::string::npos;
+    }
     quantize &= name.find("shortconv.conv.weight") == std::string::npos;
 
     // do not quantize LFM3-VL's depthwise conv kernels, CONV_2D_DW takes F32 kernels
@@ -977,6 +980,15 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
         }
     }
     qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)qs.model.hparams.n_layer_all;
+    if (qs.model.arch == LLM_ARCH_DORY) {
+        // The mixed recipe counts physical FFNs, not recurrent cache slots.
+        qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = 0;
+        for (const auto & tm : metadata) {
+            if (tm.category == tensor_category::FFN_DOWN) { ++qs.n_ffn_down; }
+            if (tm.category == tensor_category::FFN_GATE) { ++qs.n_ffn_gate; }
+            if (tm.category == tensor_category::FFN_UP)   { ++qs.n_ffn_up; }
+        }
+    }
 }
 
 //

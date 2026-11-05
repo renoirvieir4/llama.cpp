@@ -17,6 +17,8 @@ __all__ = [
 
 
 TEXT_MODEL_MAP: dict[str, str] = {
+    "DoryForCausalLM": "dory",
+    "SenseNovaLoopForConditionalGeneration": "sensenova_loop",
     "NEOChatModel": "sensenova_u1",
     "AfmoeForCausalLM": "afmoe",
     "LagunaForCausalLM": "laguna",
@@ -47,6 +49,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "ChatGLMModel": "chatglm",
     "ClefModel": "clef",
     "CodeShellForCausalLM": "codeshell",
+    "CloverMoeModelLM": "clover",
     "CogVLMForCausalLM": "cogvlm",
     "Cohere2MoeForCausalLM": "command_r",
     "Cohere2ForCausalLM": "command_r",

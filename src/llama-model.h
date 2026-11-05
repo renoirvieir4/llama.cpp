@@ -220,6 +220,8 @@ struct llama_layer_convnext {
 };
 
 struct llama_layer_shortconv {
+    struct ggml_tensor * in_proj_s = nullptr;
+    struct ggml_tensor * out_proj_s = nullptr;
     struct ggml_tensor * in_proj  = nullptr;
     struct ggml_tensor * conv     = nullptr;
     struct ggml_tensor * out_proj = nullptr;
@@ -435,6 +437,12 @@ struct llama_layer {
 
     // qwen3.5
     struct ggml_tensor * ssm_alpha = nullptr;
+
+    // clover
+    struct ggml_tensor * ssm_conv1d_right   = nullptr;
+    struct ggml_tensor * ssm_bd_logit_scale = nullptr;
+    struct ggml_tensor * ssm_bd_history_b   = nullptr;
+    struct ggml_tensor * ssm_bd_history     = nullptr;
 
     // rwkv
     struct ggml_tensor * time_mix_w1         = nullptr;
@@ -887,6 +895,10 @@ struct llama_model {
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
     bool no_alloc() const;
+
+    // Weight placement uses physical blocks; graph and KV indices use execution layers.
+    virtual uint32_t n_layer_physical() const { return hparams.n_layer_all; }
+    virtual int layer_physical(int il) const { return il; }
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

@@ -25,7 +25,7 @@ ggml_tensor * llm_build_lfm_base::build_lfm_shortconv(const llama_model & model,
     // {n_embd, n_tokens} => {n_embd, n_seq_tokens, n_seqs}
     cur = ggml_reshape_3d(ctx0, cur, cur->ne[0], n_seq_tokens, n_seqs);
 
-    auto * bcx = build_lora_mm(model.layers[il].shortconv.in_proj, cur);
+    auto * bcx = build_lora_mm(model.layers[il].shortconv.in_proj, cur, model.layers[il].shortconv.in_proj_s);
     cb(bcx, "model.layers.{}.conv.in_proj", il);
 
     constexpr auto n_chunks = 3;
@@ -76,7 +76,7 @@ ggml_tensor * llm_build_lfm_base::build_lfm_shortconv(const llama_model & model,
     cb(conv_out, "model.layers.{}.conv.conv", il);
 
     auto * y = ggml_mul(ctx0, c, conv_out);
-    y        = build_lora_mm(model.layers[il].shortconv.out_proj, y);
+    y        = build_lora_mm(model.layers[il].shortconv.out_proj, y, model.layers[il].shortconv.out_proj_s);
     cb(y, "model.layers.{}.conv.out_proj", il);
     // {n_embd, n_seq_tokens, n_seqs} => {n_embd, n_tokens}
     y = ggml_reshape_2d(ctx0, y, y->ne[0], n_seq_tokens * n_seqs);
@@ -89,7 +89,7 @@ ggml_tensor * llm_build_lfm_base::build_lfm_shortconv(const llama_model & model,
                                                       int il) {
     const int64_t d_conv = hparams.n_shortconv_l_cache - 1;
 
-    auto * bcx = build_lora_mm(model.layers[il].shortconv.in_proj, cur);
+    auto * bcx = build_lora_mm(model.layers[il].shortconv.in_proj, cur, model.layers[il].shortconv.in_proj_s);
     cb(bcx, "model.layers.{}.conv.in_proj", il);
 
     const int64_t chunk_size = bcx->ne[0] / 3;
@@ -105,7 +105,7 @@ ggml_tensor * llm_build_lfm_base::build_lfm_shortconv(const llama_model & model,
     cb(conv_out, "model.layers.{}.conv.conv", il);
 
     auto * y = ggml_mul(ctx0, c, ggml_reshape_2d(ctx0, conv_out, chunk_size, n_tokens));
-    y = build_lora_mm(model.layers[il].shortconv.out_proj, y);
+    y = build_lora_mm(model.layers[il].shortconv.out_proj, y, model.layers[il].shortconv.out_proj_s);
     cb(y, "model.layers.{}.conv.out_proj", il);
 
     return y;
@@ -118,9 +118,9 @@ ggml_tensor * llm_build_lfm_base::build_lfm_dense_ffn(const llama_model & model,
     GGML_ASSERT(!model.layers[il].ffn_gate_b);
     GGML_ASSERT(!model.layers[il].ffn_down_b);
     return build_ffn(cur,
-        model.layers[il].ffn_up,   NULL, NULL,
-        model.layers[il].ffn_gate, NULL, NULL,
-        model.layers[il].ffn_down, NULL, NULL,
+        model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
+        model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+        model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
         NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
 }
 

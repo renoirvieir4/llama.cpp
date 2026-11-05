@@ -24,6 +24,20 @@ void llama_model_lfm3::load_arch_hparams(llama_model_loader & ml) {
         hparams.non_causal_type = LLAMA_NON_CAUSAL_TYPE_DENSE_ONLY;
     }
 
+    uint32_t version = 0;
+    if (ml.get_key("lfm3.loop_mhc.version", version, false)) {
+        uint32_t streams, passes, physical, iterations;
+        ml.get_key("lfm3.loop_mhc.streams", streams);
+        ml.get_key("lfm3.loop_mhc.passes", passes);
+        ml.get_key("lfm3.loop_mhc.physical_layers", physical);
+        ml.get_key("lfm3.loop_mhc.iterations", iterations);
+        if (version != 1 || streams != 4 || passes != 2 || physical != 24 ||
+            iterations != 20 || hparams.n_layer() != 48 || !hparams.causal_attn) {
+            throw std::runtime_error("Unsupported LFM3 loop/mHC settings");
+        }
+        loop_mhc = true;
+    }
+
     switch (hparams.n_ff()) {
         case 7680: type = LLM_TYPE_1_7B; break;
         default:   type = LLM_TYPE_UNKNOWN;
@@ -44,6 +58,26 @@ void llama_model_lfm3::load_arch_tensors(llama_model_loader &) {
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
+        if (loop_mhc && i >= 24) {
+            layer = layers[i - 24];
+            layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {1}, 0);
+            layer.hc_ffn_scale = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE, "weight", i), {1}, 0);
+            if (layer.hc_attn_scale->type != GGML_TYPE_F32 || layer.hc_ffn_scale->type != GGML_TYPE_F32) {
+                throw std::runtime_error("LFM3 loop gates must be FP32");
+            }
+            continue;
+        }
+        if (loop_mhc) {
+            layer.hc_attn_fn = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN, "weight", i), {4 * n_embd, 24}, 0);
+            layer.hc_attn_base = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE, "bias", i), {24}, 0);
+            layer.hc_ffn_fn = create_tensor(tn(LLM_TENSOR_HC_FFN_FN, "weight", i), {4 * n_embd, 24}, 0);
+            layer.hc_ffn_base = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE, "bias", i), {24}, 0);
+            for (auto * tensor : {layer.hc_attn_fn, layer.hc_attn_base, layer.hc_ffn_fn, layer.hc_ffn_base}) {
+                if (tensor->type != GGML_TYPE_F32) {
+                    throw std::runtime_error("LFM3 mHC routers must be FP32");
+                }
+            }
+        }
 
         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd}, 0);
         layer.ffn_norm       = create_tensor(tn(LLM_TENSOR_FFN_NORM,       "weight", i), {n_embd}, 0);
@@ -84,6 +118,22 @@ void llama_model_lfm3::load_arch_tensors(llama_model_loader &) {
             layer.shortconv.conv     = create_tensor(tn(LLM_TENSOR_SHORTCONV_CONV,    "weight", i), {hparams.n_shortconv_l_cache, n_embd}, 0);
             layer.shortconv.in_proj  = create_tensor(tn(LLM_TENSOR_SHORTCONV_INPROJ,  "weight", i), {n_embd, 3 * n_embd}, 0);
             layer.shortconv.out_proj = create_tensor(tn(LLM_TENSOR_SHORTCONV_OUTPROJ, "weight", i), {n_embd, n_embd}, 0);
+        }
+        // Load scales before later visits alias the physical layer.
+        if (loop_mhc) {
+            layer.ffn_up_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+            layer.ffn_gate_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+            layer.ffn_down_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+            if (hparams.is_recr(i)) {
+                layer.shortconv.in_proj_s = create_tensor(tn(LLM_TENSOR_SHORTCONV_INPROJ, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.shortconv.out_proj_s = create_tensor(tn(LLM_TENSOR_SHORTCONV_OUTPROJ, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+            } else {
+                layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wk_s = create_tensor(tn(LLM_TENSOR_ATTN_K, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wv_s = create_tensor(tn(LLM_TENSOR_ATTN_V, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wo_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_gate_s = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+            }
         }
     }
 }
@@ -129,7 +179,7 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
                 q, k, v, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
         cb(attn_out, "attn_out", il);
 
-        ggml_tensor * gate = build_lora_mm(model.layers[il].wqkv_gate, cur_in);
+        ggml_tensor * gate = build_lora_mm(model.layers[il].wqkv_gate, cur_in, model.layers[il].wqkv_gate_s);
         gate = ggml_sigmoid(ctx0, gate);
         cb(gate, "model.layers.{}.self_attn.gate", il);
 
@@ -144,6 +194,74 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
         return out;
     };
 
+    const bool loop_mhc = static_cast<const llama_model_lfm3 &>(model).loop_mhc;
+    struct mhc_state { ggml_tensor * residual; ggml_tensor * post; ggml_tensor * mix; };
+    auto round_bf16 = [this](ggml_tensor * x) {
+        return ggml_cast(ctx0, ggml_cast(ctx0, x, GGML_TYPE_BF16), GGML_TYPE_F32);
+    };
+    auto stream = [this](ggml_tensor * x, int i) {
+        return ggml_view_2d(ctx0, x, n_embd, x->ne[2], x->nb[2], i * x->nb[1]);
+    };
+    auto read_mhc = [this, &round_bf16, &stream](ggml_tensor * r, ggml_tensor * w, ggml_tensor * b, mhc_state & state) {
+        const int64_t nt = r->ne[2];
+        state.residual = r;
+        auto * flat = ggml_reshape_2d(ctx0, r, 4 * n_embd, nt);
+        auto * norm = ggml_rms_norm(ctx0, flat, 1e-6f);
+        ggml_tensor * projection = nullptr;
+        for (int row = 0; row < 24; ++row) {
+            auto * weight = ggml_view_2d(ctx0, w, 4 * n_embd, 1, w->nb[1], row * w->nb[1]);
+            auto * dot = ggml_sum_rows(ctx0, ggml_mul(ctx0, norm, weight));
+            projection = projection ? ggml_concat(ctx0, projection, dot, 0) : dot;
+        }
+        auto * logits = ggml_add(ctx0, projection, b);
+        auto * pre = ggml_sigmoid(ctx0, ggml_cont(ctx0, ggml_view_2d(ctx0, logits, 4, nt, logits->nb[1], 0)));
+        pre = ggml_div(ctx0, pre, ggml_sum_rows(ctx0, pre));
+        state.post = ggml_scale(ctx0, ggml_sigmoid(ctx0, ggml_cont(ctx0,
+            ggml_view_2d(ctx0, logits, 4, nt, logits->nb[1], 4 * logits->nb[0]))), 2.0f);
+        auto * mix = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, 16, nt, logits->nb[1], 8 * logits->nb[0]));
+        mix = ggml_reshape_3d(ctx0, mix, 4, 4, nt);
+        for (int i = 0; i < 20; ++i) {
+            mix = ggml_log(ctx0, ggml_soft_max(ctx0, mix));
+            mix = ggml_cont(ctx0, ggml_permute(ctx0, mix, 1, 0, 2, 3));
+            mix = ggml_log(ctx0, ggml_soft_max(ctx0, mix));
+            mix = ggml_cont(ctx0, ggml_permute(ctx0, mix, 1, 0, 2, 3));
+        }
+        mix = ggml_exp(ctx0, mix);
+        state.mix = ggml_div(ctx0, mix, ggml_sum_rows(ctx0, mix));
+        auto * anchor = stream(r, 0);
+        ggml_tensor * delta = nullptr;
+        for (int i = 0; i < 4; ++i) {
+            auto * coeff = ggml_view_2d(ctx0, pre, 1, nt, pre->nb[1], i * pre->nb[0]);
+            auto * term = ggml_mul(ctx0, ggml_sub(ctx0, stream(r, i), anchor), coeff);
+            delta = delta ? ggml_add(ctx0, delta, term) : term;
+        }
+        return round_bf16(ggml_add(ctx0, anchor, delta));
+    };
+    auto merge_mhc = [this, &round_bf16, &stream](const mhc_state & state, ggml_tensor * branch, ggml_tensor * gate) {
+        auto * r = state.residual;
+        const int64_t nt = r->ne[2];
+        auto * anchor = stream(r, 0);
+        ggml_tensor * result = nullptr;
+        for (int i = 0; i < 4; ++i) {
+            ggml_tensor * delta = nullptr;
+            for (int j = 0; j < 4; ++j) {
+                auto * coeff = ggml_view_2d(ctx0, state.mix, 1, nt, state.mix->nb[2], i * state.mix->nb[1] + j * state.mix->nb[0]);
+                auto * term = ggml_mul(ctx0, ggml_sub(ctx0, stream(r, j), anchor), coeff);
+                delta = delta ? ggml_add(ctx0, delta, term) : term;
+            }
+            auto * post = ggml_view_2d(ctx0, state.post, 1, nt, state.post->nb[1], i * state.post->nb[0]);
+            auto * candidate = round_bf16(ggml_add(ctx0, round_bf16(ggml_add(ctx0, anchor, delta)),
+                round_bf16(ggml_mul(ctx0, round_bf16(branch), post))));
+            if (gate) {
+                auto * old = stream(r, i);
+                candidate = round_bf16(ggml_add(ctx0, old, ggml_mul(ctx0, ggml_sub(ctx0, candidate, old), ggml_tanh(ctx0, gate))));
+            }
+            auto * out = ggml_reshape_3d(ctx0, candidate, n_embd, 1, nt);
+            result = result ? ggml_concat(ctx0, result, out, 1) : out;
+        }
+        return result;
+    };
+
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
     cb(cur, "model.embed_tokens", -1);
 
@@ -156,7 +274,14 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    if (loop_mhc) {
+        cur = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), n_embd, 4, n_tokens, 1);
+    }
     for (int il = 0; il < n_layer; ++il) {
+        mhc_state attn_state{}, ffn_state{};
+        if (loop_mhc) {
+            cur = read_mhc(cur, model.layers[il].hc_attn_fn, model.layers[il].hc_attn_base, attn_state);
+        }
         auto * prev_cur = cur;
 
         cur = build_norm(cur, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
@@ -180,12 +305,17 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
             cb(cur, "model.layers.{}.post_operator_norm", il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (!loop_mhc && il == n_layer - 1 && inp_out_ids) {
             cur      = ggml_get_rows(ctx0, cur, inp_out_ids);
             prev_cur = ggml_get_rows(ctx0, prev_cur, inp_out_ids);
         }
 
-        cur = ggml_add(ctx0, prev_cur, cur);
+        if (loop_mhc) {
+            cur = merge_mhc(attn_state, cur, model.layers[il].hc_attn_scale);
+            cur = read_mhc(cur, model.layers[il].hc_ffn_fn, model.layers[il].hc_ffn_base, ffn_state);
+        } else {
+            cur = ggml_add(ctx0, prev_cur, cur);
+        }
 
         auto * ffn_norm_out = build_norm(cur, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
         cb(ffn_norm_out, "model.layers.{}.ffn_norm", il);
@@ -197,12 +327,20 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
             cb(ffn_out, "model.layers.{}.post_ffn_norm", il);
         }
 
-        cur = ggml_add(ctx0, cur, ffn_out);
+        cur = loop_mhc ? merge_mhc(ffn_state, ffn_out, model.layers[il].hc_ffn_scale) : ggml_add(ctx0, cur, ffn_out);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
     }
 
+    if (loop_mhc) {
+        auto * anchor = stream(cur, 0);
+        auto * delta = ggml_sub(ctx0, stream(cur, 1), anchor);
+        delta = ggml_add(ctx0, delta, ggml_sub(ctx0, stream(cur, 2), anchor));
+        delta = ggml_add(ctx0, delta, ggml_sub(ctx0, stream(cur, 3), anchor));
+        cur = round_bf16(ggml_add(ctx0, anchor, ggml_scale(ctx0, delta, 0.25f)));
+        if (inp_out_ids) { cur = ggml_get_rows(ctx0, cur, inp_out_ids); }
+    }
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;

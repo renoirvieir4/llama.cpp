@@ -7,6 +7,7 @@
 #include <vector>
 
 static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+    { LLM_ARCH_DORY,             "dory"             },
     { LLM_ARCH_CLIP,             "clip"             }, // dummy, only used by llama-quantize
     { LLM_ARCH_LLAMA,            "llama"            },
     { LLM_ARCH_LLAMA4,           "llama4"           },
@@ -41,10 +42,12 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_QWEN3NEXT,        "qwen3next"        },
     { LLM_ARCH_QWEN3VL,          "qwen3vl"          },
     { LLM_ARCH_QWEN3VLMOE,       "qwen3vlmoe"       },
+    { LLM_ARCH_SENSENOVA_LOOP,   "sensenova_loop" },
     { LLM_ARCH_QWEN35,           "qwen35"           },
     { LLM_ARCH_QWEN35MOE,        "qwen35moe"        },
     { LLM_ARCH_CLEF,             "clef"             },
     { LLM_ARCH_VLLM_DECISION2,   "vllm-decision2"   },
+    { LLM_ARCH_CLOVER_MOE,       "clover_moe"       },
     { LLM_ARCH_QWEN4EXP,         "qwen4exp"         },
     { LLM_ARCH_PHI2,             "phi2"             },
     { LLM_ARCH_PHI3,             "phi3"             },
@@ -262,7 +265,19 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_TOKEN_SHIFT_COUNT,                 "%s.token_shift_count"                 },
     { LLM_KV_INTERLEAVE_MOE_LAYER_STEP,         "%s.interleave_moe_layer_step"         },
     { LLM_KV_FULL_ATTENTION_INTERVAL,           "%s.full_attention_interval"           },
+    { LLM_KV_CLOVER_CORESET_ENABLED,            "%s.moe_block_coreset_enabled"         },
+    { LLM_KV_CLOVER_CORESET_TOP_P,              "%s.moe_block_coreset_top_p"           },
     { LLM_KV_NUM_LOOPS,                         "%s.num_loops"                         },
+    { LLM_KV_INPUT_LAYER_COUNT,                 "%s.input_layer_count"                 },
+    { LLM_KV_RECURRENT_LAYER_COUNT,             "%s.recurrent_layer_count"             },
+    { LLM_KV_OUTPUT_LAYER_COUNT,                "%s.output_layer_count"                },
+    { LLM_KV_RECURRENT_KV_CACHE_MODE,            "%s.recurrent_kv_cache_mode"            },
+    { LLM_KV_LAYER_PATTERN,                     "%s.layer_pattern"                     },
+    { LLM_KV_ROPE_PROFILE,                      "%s.rope.profile"                      },
+    { LLM_KV_ROPE_FREQ_BASE_2,                   "%s.rope.freq_base_2"                   },
+    { LLM_KV_INIT_STD,                          "%s.init_std"                          },
+    { LLM_KV_ALPHA_INIT,                        "%s.alpha_init"                        },
+    { LLM_KV_GATE_INIT,                         "%s.gate_init"                         },
     { LLM_KV_SKIP_LOOP_FINAL_NORM,              "%s.skip_loop_final_norm"              },
     { LLM_KV_HRM_LAYERS_PER_STACK,              "%s.hrm.layers_per_stack"              },
     { LLM_KV_HRM_H_CYCLES,                      "%s.hrm.h_cycles"                      },
@@ -496,6 +511,12 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
 };
 
 static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+    { LLM_TENSOR_RESIDUAL_ALPHA,                         "blk.%d.residual_alpha" },
+    { LLM_TENSOR_ATTN_QK_SCALE,                          "blk.%d.attn_qk_scale" },
+    { LLM_TENSOR_ATTN_GATE_SCALE,                        "blk.%d.attn_gate_scale" },
+    { LLM_TENSOR_FFN_GATE_SCALE,                         "blk.%d.ffn_gate_scale" },
+    { LLM_TENSOR_FFN_UP_SCALE,                           "blk.%d.ffn_up_scale" },
+    { LLM_TENSOR_OUTPUT_SCALE,                          "output_scale" },
     { LLM_TENSOR_TOKEN_EMBD,                             "token_embd" },
     { LLM_TENSOR_OUTPUT_NORM,                            "output_norm" },
     { LLM_TENSOR_OUTPUT_NORM_LFM2,                       "token_embd_norm" }, // fix for wrong tensor name
@@ -577,6 +598,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_FFN_GATE_INP_SHEXP,                     "blk.%d.ffn_gate_inp_shexp" },
     { LLM_TENSOR_SSM_A_NOSCAN,                           "blk.%d.ssm_a" },
     { LLM_TENSOR_SSM_CONV1D,                             "blk.%d.ssm_conv1d" },
+    { LLM_TENSOR_SSM_BD_LOGIT_SCALE,                     "blk.%d.ssm_bd_logit_scale" },
+    { LLM_TENSOR_SSM_BD_HISTORY,                         "blk.%d.ssm_bd_history" },
     { LLM_TENSOR_SSM_DT,                                 "blk.%d.ssm_dt" },
     { LLM_TENSOR_SSM_BETA_ALPHA,                         "blk.%d.ssm_ba" },
     { LLM_TENSOR_SSM_ALPHA,                              "blk.%d.ssm_alpha" },
@@ -835,6 +858,12 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
 // example: https://github.com/ggml-org/llama.cpp/pull/17548
 //
 static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+    {LLM_TENSOR_RESIDUAL_ALPHA,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
+    {LLM_TENSOR_ATTN_QK_SCALE,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
+    {LLM_TENSOR_ATTN_GATE_SCALE,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
+    {LLM_TENSOR_FFN_GATE_SCALE,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
+    {LLM_TENSOR_FFN_UP_SCALE,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
+    {LLM_TENSOR_OUTPUT_SCALE,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_CPY}},
     {LLM_TENSOR_TOKEN_EMBD,                 {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_POS_EMBD,                   {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_TOKEN_TYPES,                {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
@@ -976,6 +1005,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_CHANNEL_MIX_VALUE,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_FFN_ACT,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_DIV}},
     {LLM_TENSOR_SSM_CONV1D,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SSM_CONV}},
+    {LLM_TENSOR_SSM_BD_LOGIT_SCALE,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_SSM_BD_HISTORY,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_SSM_A,                      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SSM_SCAN}},
     {LLM_TENSOR_SSM_A_NOSCAN,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}}, // a version of SSM_A used for MUL instead of SSM_SCAN
     {LLM_TENSOR_SSM_DT_NORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
@@ -1260,8 +1291,10 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_GLM5_NEXT:
+        case LLM_ARCH_SENSENOVA_LOOP:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_CLOVER_MOE:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_DEEPSEEK41:
@@ -1287,8 +1320,10 @@ bool llm_arch_is_diffusion(const llm_arch & arch) {
 bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_SENSENOVA_LOOP:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_CLOVER_MOE:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_DEEPSEEK41:
@@ -1323,6 +1358,7 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
 
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
+        case LLM_ARCH_DORY:
         case LLM_ARCH_GROK:
         case LLM_ARCH_MPT:
         case LLM_ARCH_PLAMO2:
@@ -1365,6 +1401,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
 
 bool llama_arch_supports_save(llm_arch arch) {
     switch (arch) {
+        case LLM_ARCH_DORY: // physical weights and virtual cache slots use different counts
         case LLM_ARCH_SENSENOVA_U1:
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_BITNET:
