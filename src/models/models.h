@@ -100,21 +100,34 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int                  il);
 };
 
+// low-rank change of one projection: out += up * (down * x)
+struct llm_lfm_delta {
+    ggml_tensor * down = nullptr;
+    ggml_tensor * up   = nullptr;
+};
+
 struct llm_build_lfm_base : public llm_graph_context {
     llm_build_lfm_base(const llm_graph_params & params);
 
     virtual ~llm_build_lfm_base() = default;
 
+    // returns out unchanged when the delta is absent
+    ggml_tensor * build_lfm_delta(const llm_lfm_delta * delta, ggml_tensor * out, ggml_tensor * x) const;
+
     ggml_tensor * build_lfm_shortconv(const llama_model & model,
                                       const llama_memory_recurrent_context * mctx_recr,
                                       llm_graph_input_rs * inp_recr,
                                       ggml_tensor * cur,
-                                      int il);
+                                      int il,
+                                      const llm_lfm_delta * in_delta  = nullptr,
+                                      const llm_lfm_delta * out_delta = nullptr);
 
     // no recurrent state (decision graphs): causal over the ubatch from a zero state
     ggml_tensor * build_lfm_shortconv(const llama_model & model,
                                       ggml_tensor * cur,
-                                      int il);
+                                      int il,
+                                      const llm_lfm_delta * in_delta  = nullptr,
+                                      const llm_lfm_delta * out_delta = nullptr);
 
     ggml_tensor * build_lfm_dense_ffn(const llama_model & model,
                                       ggml_tensor * cur,
@@ -2469,6 +2482,20 @@ struct llama_model_lfm2moe : public llama_model_base {
 
 struct llama_model_lfm3 : public llama_model_base {
     bool loop_mhc = false;
+
+    // refine loop: a plain first pass, then an extra pass over execution layers [refine_begin, refine_end)
+    // with two mHC streams and low-rank deltas, blended into the first-pass state by a token/channel gate
+    struct refine_visit {
+        llm_lfm_delta wq, wk, wv, wo, conv_in, conv_out, ffn_gate, ffn_up, ffn_down;
+    };
+    bool     loop_refine  = false;
+    int      refine_begin = 0;
+    int      refine_end   = 0;
+    uint32_t refine_rank  = 0;
+    std::vector<refine_visit> refine_visits;
+    ggml_tensor * loop_gate_logits = nullptr;
+    ggml_tensor * loop_gate_token  = nullptr;
+
     llama_model_lfm3(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;

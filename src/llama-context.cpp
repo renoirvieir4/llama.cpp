@@ -14,6 +14,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -2531,7 +2532,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_DORY) {
         // Shared weights do not reflect the expanded recurrent graph size.
         res = std::max<uint32_t>(1024u, 128u * model.hparams.n_layer());
-    } else if (model.arch == LLM_ARCH_LFM3 && !model.layers.empty() && model.layers[0].hc_attn_fn) {
+    } else if (model.arch == LLM_ARCH_LFM3 && std::any_of(model.layers.begin(), model.layers.end(), [](const llama_layer & l) { return l.hc_attn_fn != nullptr; })) {
         res = std::max<uint32_t>(n_tokens * 160, 128u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT) {
         // the n_tokens*40 budget below is exhausted at ubatch 3840

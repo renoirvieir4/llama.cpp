@@ -517,6 +517,7 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_FFN_GATE_SCALE,                         "blk.%d.ffn_gate_scale" },
     { LLM_TENSOR_FFN_UP_SCALE,                           "blk.%d.ffn_up_scale" },
     { LLM_TENSOR_OUTPUT_SCALE,                          "output_scale" },
+    { LLM_TENSOR_LOOP_GATE,                              "blk.%d.loop_gate" },
     { LLM_TENSOR_TOKEN_EMBD,                             "token_embd" },
     { LLM_TENSOR_OUTPUT_NORM,                            "output_norm" },
     { LLM_TENSOR_OUTPUT_NORM_LFM2,                       "token_embd_norm" }, // fix for wrong tensor name
@@ -864,6 +865,7 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_FFN_GATE_SCALE,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
     {LLM_TENSOR_FFN_UP_SCALE,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_CPY}},
     {LLM_TENSOR_OUTPUT_SCALE,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_CPY}},
+    {LLM_TENSOR_LOOP_GATE,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
     {LLM_TENSOR_TOKEN_EMBD,                 {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_POS_EMBD,                   {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},
     {LLM_TENSOR_TOKEN_TYPES,                {LLM_TENSOR_LAYER_INPUT,     GGML_OP_GET_ROWS}},

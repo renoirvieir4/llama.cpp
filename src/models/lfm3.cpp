@@ -38,6 +38,27 @@ void llama_model_lfm3::load_arch_hparams(llama_model_loader & ml) {
         loop_mhc = true;
     }
 
+    uint32_t refine_version = 0;
+    if (ml.get_key("lfm3.loop_refine.version", refine_version, false)) {
+        uint32_t begin, end, passes, streams, physical, rank;
+        ml.get_key("lfm3.loop_refine.begin", begin);
+        ml.get_key("lfm3.loop_refine.end", end);
+        ml.get_key("lfm3.loop_refine.passes", passes);
+        ml.get_key("lfm3.loop_refine.streams", streams);
+        ml.get_key("lfm3.loop_refine.physical_layers", physical);
+        ml.get_key("lfm3.loop_refine.delta_rank", rank);
+        // begin and end are physical layers; the extra pass visits them again right after the first pass reaches end
+        if (refine_version != 1 || loop_mhc || passes != 2 || streams != 2 || begin >= end || end > physical || rank == 0 ||
+            hparams.n_layer() != physical + (end - begin) || !hparams.causal_attn) {
+            throw std::runtime_error("Unsupported LFM3 refine loop settings");
+        }
+        loop_refine  = true;
+        refine_begin = end;
+        refine_end   = 2 * end - begin;
+        refine_rank  = rank;
+        LLAMA_LOG_INFO("%s: LFM3 refine loop: layers [%u, %u) twice, %u execution layers, delta rank %u\n", __func__, begin, end, hparams.n_layer(), rank);
+    }
+
     switch (hparams.n_ff()) {
         case 7680: type = LLM_TYPE_1_7B; break;
         default:   type = LLM_TYPE_UNKNOWN;
@@ -56,8 +77,53 @@ void llama_model_lfm3::load_arch_tensors(llama_model_loader &) {
 
     int rope_freqs_flag = 0;
 
+    if (loop_refine) {
+        refine_visits.assign(n_layer, {});
+    }
+
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
+        if (loop_refine && i >= refine_begin && i < refine_end) {
+            // the extra pass reuses the physical weights and adds its own routers and deltas
+            layer = layers[i - (refine_end - refine_begin)];
+            auto & visit = refine_visits[i];
+            const int64_t rank = refine_rank;
+            auto delta = [&](llm_tensor type, int64_t n_in, int64_t n_out) {
+                llm_lfm_delta d;
+                d.down = create_tensor(tn(type, "delta_down", i), {n_in, rank}, 0);
+                d.up   = create_tensor(tn(type, "delta_up",   i), {rank, n_out}, 0);
+                return d;
+            };
+            layer.hc_attn_fn   = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,   "weight", i), {2 * n_embd, 8}, 0);
+            layer.hc_attn_base = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE, "bias",   i), {8}, 0);
+            layer.hc_ffn_fn    = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,    "weight", i), {2 * n_embd, 8}, 0);
+            layer.hc_ffn_base  = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,  "bias",   i), {8}, 0);
+            visit.ffn_gate = delta(LLM_TENSOR_FFN_GATE, n_embd, n_ff);
+            visit.ffn_up   = delta(LLM_TENSOR_FFN_UP,   n_embd, n_ff);
+            visit.ffn_down = delta(LLM_TENSOR_FFN_DOWN, n_ff,   n_embd);
+            if (hparams.is_recr(i)) {
+                visit.conv_in  = delta(LLM_TENSOR_SHORTCONV_INPROJ,  n_embd, 3 * n_embd);
+                visit.conv_out = delta(LLM_TENSOR_SHORTCONV_OUTPROJ, n_embd, n_embd);
+            } else {
+                visit.wq = delta(LLM_TENSOR_ATTN_Q,   n_embd, n_embd_head_k * n_head);
+                visit.wk = delta(LLM_TENSOR_ATTN_K,   n_embd, hparams.n_embd_k_gqa(i));
+                visit.wv = delta(LLM_TENSOR_ATTN_V,   n_embd, hparams.n_embd_v_gqa(i));
+                visit.wo = delta(LLM_TENSOR_ATTN_OUT, n_embd_head_k * n_head, n_embd);
+            }
+            std::vector<ggml_tensor *> fp32 = {layer.hc_attn_fn, layer.hc_attn_base, layer.hc_ffn_fn, layer.hc_ffn_base};
+            if (i == refine_end - 1) {
+                loop_gate_logits = create_tensor(tn(LLM_TENSOR_LOOP_GATE, "logits", i), {n_embd}, 0);
+                loop_gate_token  = create_tensor(tn(LLM_TENSOR_LOOP_GATE, "token",  i), {n_embd}, 0);
+                fp32.push_back(loop_gate_logits);
+                fp32.push_back(loop_gate_token);
+            }
+            for (auto * tensor : fp32) {
+                if (tensor->type != GGML_TYPE_F32) {
+                    throw std::runtime_error("LFM3 refine routers and gate must be FP32");
+                }
+            }
+            continue;
+        }
         if (loop_mhc && i >= 24) {
             layer = layers[i - 24];
             layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {1}, 0);
@@ -120,7 +186,7 @@ void llama_model_lfm3::load_arch_tensors(llama_model_loader &) {
             layer.shortconv.out_proj = create_tensor(tn(LLM_TENSOR_SHORTCONV_OUTPROJ, "weight", i), {n_embd, n_embd}, 0);
         }
         // Load scales before later visits alias the physical layer.
-        if (loop_mhc) {
+        if (loop_mhc || loop_refine) {
             layer.ffn_up_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             layer.ffn_gate_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
             layer.ffn_down_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "scale", i), {1}, TENSOR_NOT_REQUIRED);
@@ -151,7 +217,8 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
     auto build_attn_block = [&model, this](ggml_tensor * cur_in,
                                            ggml_tensor * inp_pos,
                                            auto *        inp_attn,
-                                           int           il) -> ggml_tensor * {
+                                           int           il,
+                                           const llama_model_lfm3::refine_visit * visit) -> ggml_tensor * {
         const int64_t n_embd_head = hparams.n_embd_head_k(il);
         const int64_t n_head_il   = hparams.n_head(il);
         const int64_t n_head_kv   = hparams.n_head_kv(il);
@@ -163,6 +230,15 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
         ggml_tensor * rope_factors = hparams.is_swa(il) ? nullptr : model.layers[il].rope_freqs;
 
         auto [q, k, v] = build_qkv(model.layers[il], cur_in, n_embd_head, n_head_il, n_head_kv, il);
+        if (visit) {
+            auto add_delta = [this, cur_in](ggml_tensor * t, const llm_lfm_delta & d) {
+                ggml_tensor * dx = ggml_mul_mat(ctx0, d.up, ggml_mul_mat(ctx0, d.down, cur_in));
+                return ggml_add(ctx0, t, ggml_reshape_3d(ctx0, dx, t->ne[0], t->ne[1], t->ne[2]));
+            };
+            q = add_delta(q, visit->wq);
+            k = add_delta(k, visit->wk);
+            v = add_delta(v, visit->wv);
+        }
 
         q = build_norm(q, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
         cb(q, "model.layers.{}.self_attn.q_layernorm", il);
@@ -189,6 +265,9 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
         attn_out = ggml_reshape_2d(ctx0, attn_3d, n_embd_head * n_head_il, n_tokens);
 
         ggml_tensor * out = build_lora_mm(model.layers[il].wo, attn_out, model.layers[il].wo_s);
+        if (visit) {
+            out = build_lfm_delta(&visit->wo, out, attn_out);
+        }
         cb(out, "model.layers.{}.self_attn.out_proj", il);
 
         return out;
@@ -262,6 +341,50 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
         return result;
     };
 
+    // refine loop: the casts follow the BF16 reference, where the residual streams and the pre, post and mix weights are BF16
+    const auto & lfm3 = static_cast<const llama_model_lfm3 &>(model);
+    struct refine_state { ggml_tensor * residual; ggml_tensor * post0; ggml_tensor * post1; ggml_tensor * diag; ggml_tensor * off; };
+    auto row = [this](ggml_tensor * x, int i) {
+        return ggml_cont(ctx0, ggml_view_2d(ctx0, x, 1, x->ne[1], x->nb[1], i * x->nb[0]));
+    };
+    auto read_refine = [this, &round_bf16, &stream, &row](ggml_tensor * r, ggml_tensor * w, ggml_tensor * b, refine_state & state) {
+        state.residual = r;
+        auto * norm   = ggml_rms_norm(ctx0, ggml_reshape_2d(ctx0, r, 2 * n_embd, r->ne[2]), 1e-6f);
+        auto * logits = ggml_add(ctx0, ggml_mul_mat(ctx0, w, norm), b);
+        auto * act    = ggml_sigmoid(ctx0, logits);
+        state.post0 = round_bf16(ggml_scale(ctx0, row(act, 2), 2.0f));
+        state.post1 = round_bf16(ggml_scale(ctx0, row(act, 3), 2.0f));
+        // closed-form Sinkhorn limit of a 2x2 mix: [[diag, off], [off, diag]]
+        auto * diag = ggml_sigmoid(ctx0, ggml_scale(ctx0,
+            ggml_sub(ctx0, ggml_sub(ctx0, ggml_add(ctx0, row(logits, 4), row(logits, 7)), row(logits, 5)), row(logits, 6)), 0.5f));
+        state.diag = round_bf16(diag);
+        state.off  = round_bf16(ggml_scale_bias(ctx0, diag, -1.0f, 1.0f));
+        auto * branch = ggml_add(ctx0, ggml_mul(ctx0, stream(r, 0), round_bf16(row(act, 0))), ggml_mul(ctx0, stream(r, 1), round_bf16(row(act, 1))));
+        return round_bf16(branch);
+    };
+    auto merge_refine = [this, &round_bf16, &stream](const refine_state & state, ggml_tensor * branch) {
+        auto * r = state.residual;
+        branch = round_bf16(branch);
+        auto merged = [&](ggml_tensor * own, ggml_tensor * other, ggml_tensor * post) {
+            auto * mixed = round_bf16(ggml_add(ctx0, ggml_mul(ctx0, own, state.diag), ggml_mul(ctx0, other, state.off)));
+            auto * out   = round_bf16(ggml_add(ctx0, mixed, round_bf16(ggml_mul(ctx0, branch, post))));
+            return ggml_reshape_3d(ctx0, out, n_embd, 1, r->ne[2]);
+        };
+        return ggml_concat(ctx0, merged(stream(r, 0), stream(r, 1), state.post0), merged(stream(r, 1), stream(r, 0), state.post1), 1);
+    };
+    auto refine_ffn = [this](ggml_tensor * x, const llama_layer & layer, const llama_model_lfm3::refine_visit & visit) {
+        auto * gate = build_lfm_delta(&visit.ffn_gate, build_lora_mm(layer.ffn_gate, x, layer.ffn_gate_s), x);
+        auto * up   = build_lfm_delta(&visit.ffn_up,   build_lora_mm(layer.ffn_up,   x, layer.ffn_up_s),   x);
+        auto * h    = ggml_swiglu_split(ctx0, gate, up);
+        return build_lfm_delta(&visit.ffn_down, build_lora_mm(layer.ffn_down, h, layer.ffn_down_s), h);
+    };
+    auto blend_refine = [this, &round_bf16, &lfm3](ggml_tensor * old, ggml_tensor * candidate) {
+        auto * signal = ggml_sum_rows(ctx0, ggml_mul(ctx0, ggml_rms_norm(ctx0, old, 1e-6f), lfm3.loop_gate_token));
+        auto * gate   = ggml_sigmoid(ctx0, ggml_add(ctx0, ggml_repeat(ctx0, lfm3.loop_gate_logits, old), signal));
+        return round_bf16(ggml_add(ctx0, old, ggml_mul(ctx0, gate, ggml_sub(ctx0, candidate, old))));
+    };
+    ggml_tensor * pass_input = nullptr;
+
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
     cb(cur, "model.embed_tokens", -1);
 
@@ -278,6 +401,51 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
         cur = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens), n_embd, 4, n_tokens, 1);
     }
     for (int il = 0; il < n_layer; ++il) {
+        if (lfm3.loop_refine && il >= lfm3.refine_begin && il < lfm3.refine_end) {
+            const auto & layer = model.layers[il];
+            const auto & visit = lfm3.refine_visits[il];
+            if (il == lfm3.refine_begin) {
+                pass_input = round_bf16(cur);
+                cur = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, pass_input, n_embd, 1, n_tokens), n_embd, 2, n_tokens, 1);
+            }
+            refine_state state{};
+            ggml_tensor * branch = read_refine(cur, layer.hc_attn_fn, layer.hc_attn_base, state);
+            branch = build_norm(branch, layer.attn_norm, NULL, LLM_NORM_RMS, il);
+            if (hparams.is_recr(il)) {
+                if constexpr (decision) {
+                    branch = build_lfm_shortconv(model, branch, il, &visit.conv_in, &visit.conv_out);
+                } else {
+                    const auto * mctx_recr = static_cast<const llama_memory_hybrid_iswa_context *>(mctx)->get_recr();
+                    branch = build_lfm_shortconv(model, mctx_recr, inp_hybrid->get_recr(), branch, il, &visit.conv_in, &visit.conv_out);
+                }
+            } else if constexpr (decision) {
+                branch = build_attn_block(branch, inp_pos, inp_attn, il, &visit);
+            } else {
+                branch = build_attn_block(branch, inp_pos, inp_hybrid->get_attn(), il, &visit);
+            }
+            if (layer.attn_post_norm) {
+                branch = build_norm(branch, layer.attn_post_norm, NULL, LLM_NORM_RMS, il);
+            }
+            cur = merge_refine(state, branch);
+            branch = read_refine(cur, layer.hc_ffn_fn, layer.hc_ffn_base, state);
+            branch = build_norm(branch, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
+            branch = refine_ffn(branch, layer, visit);
+            if (layer.ffn_post_norm) {
+                branch = build_norm(branch, layer.ffn_post_norm, NULL, LLM_NORM_RMS, il);
+            }
+            cur = merge_refine(state, branch);
+            if (il == lfm3.refine_end - 1) {
+                // leave the pass: average the streams, then gate the result into the first-pass state
+                cur = blend_refine(pass_input, round_bf16(ggml_scale(ctx0, ggml_add(ctx0, stream(cur, 0), stream(cur, 1)), 0.5f)));
+                if (il == n_layer - 1 && inp_out_ids) {
+                    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+                }
+                cur = build_cvec(cur, il);
+            }
+            cb(cur, "l_out", il);
+            continue;
+        }
+
         mhc_state attn_state{}, ffn_state{};
         if (loop_mhc) {
             cur = read_mhc(cur, model.layers[il].hc_attn_fn, model.layers[il].hc_attn_base, attn_state);
@@ -295,9 +463,9 @@ llama_model_lfm3::graph<decision>::graph(const llama_model & model, const llm_gr
                 cur = build_lfm_shortconv(model, mctx_recr, inp_hybrid->get_recr(), cur, il);
             }
         } else if constexpr (decision) {
-            cur = build_attn_block(cur, inp_pos, inp_attn, il);
+            cur = build_attn_block(cur, inp_pos, inp_attn, il, nullptr);
         } else {
-            cur = build_attn_block(cur, inp_pos, inp_hybrid->get_attn(), il);
+            cur = build_attn_block(cur, inp_pos, inp_hybrid->get_attn(), il, nullptr);
         }
 
         if (model.layers[il].attn_post_norm) {
