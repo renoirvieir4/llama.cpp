@@ -1,5 +1,9 @@
 # llama.cpp
 
+> [!NOTE]
+> **This branch, `round2-1.7b-loop-preview`, is llama.cpp `ff0d396e3` plus support for the looped LFM3 model [round2-1.7b-loop-preview](https://huggingface.co/notfakerv/round2-1.7b-loop-preview).**
+> Build and run recipe: [ROUND2-1.7B-LOOP-PREVIEW.md](ROUND2-1.7B-LOOP-PREVIEW.md), or run `scripts/round2-loop-preview.sh`. Everything below is upstream llama.cpp's README.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">
