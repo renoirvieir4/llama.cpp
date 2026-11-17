@@ -1216,6 +1216,233 @@ static std::vector<size_t> unicode_regex_split_custom_newlines(const std::string
     return bpe_offsets;
 }
 
+// Maxwell pre-tokenizer: a Sequence of Split(behavior=Isolated) steps, each one splits the pieces of the previous step.
+// match(pos, end) returns the length of the match at pos (0 = none); unmatched spans between matches stay one piece.
+template <typename F>
+static std::vector<size_t> unicode_regex_split_isolated(const std::vector<uint32_t> & cpts, const std::vector<size_t> & offsets, F match) {
+    std::vector<size_t> bpe_offsets;
+    bpe_offsets.reserve(offsets.size());
+
+    size_t start = 0;
+    for (auto offset : offsets) {
+        const size_t ini = start;
+        const size_t end = start + offset;
+        assert(end <= cpts.size());
+        (void) cpts; // only read by the assert
+        start = end;
+
+        size_t prev = ini;
+        for (size_t pos = ini; pos < end; ) {
+            const size_t len = match(pos, end);
+            if (len == 0) {
+                pos++;
+                continue;
+            }
+            if (pos > prev) {
+                bpe_offsets.push_back(pos - prev);
+            }
+            bpe_offsets.push_back(len);
+            pos += len;
+            prev = pos;
+        }
+        if (end > prev) {
+            bpe_offsets.push_back(end - prev);
+        }
+    }
+
+    return bpe_offsets;
+}
+
+// \p{Han} (Script=Han, Unicode 15.1), assigned code points only; unicode_cpt_is_han covers whole blocks
+static bool unicode_cpt_is_han_script(uint32_t cpt) {
+    static const uint32_t ranges[][2] = {
+        {0x2E80, 0x2E99}, {0x2E9B, 0x2EF3}, {0x2F00, 0x2FD5}, {0x3005, 0x3005}, {0x3007, 0x3007},
+        {0x3021, 0x3029}, {0x3038, 0x303B}, {0x3400, 0x4DBF}, {0x4E00, 0x9FFF}, {0xF900, 0xFA6D},
+        {0xFA70, 0xFAD9}, {0x16FE2, 0x16FE3}, {0x16FF0, 0x16FF1}, {0x20000, 0x2A6DF}, {0x2A700, 0x2B739},
+        {0x2B740, 0x2B81D}, {0x2B820, 0x2CEA1}, {0x2CEB0, 0x2EBE0}, {0x2EBF0, 0x2EE5D}, {0x2F800, 0x2FA1D},
+        {0x30000, 0x3134A}, {0x31350, 0x323AF},
+    };
+    if (cpt < 0x2E80) {
+        return false;
+    }
+    for (const auto & r : ranges) {
+        if (cpt >= r[0] && cpt <= r[1]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// regex: \n
+static std::vector<size_t> unicode_regex_split_custom_maxwell_newline(const std::string & text, const std::vector<size_t> & offsets) {
+    const auto cpts = unicode_cpts_from_utf8(text);
+    return unicode_regex_split_isolated(cpts, offsets, [&](size_t pos, size_t) -> size_t {
+        return cpts[pos] == '\n' ? 1 : 0;
+    });
+}
+
+// regex: [^\p{L}\p{N}]?[\p{Han}]+
+static std::vector<size_t> unicode_regex_split_custom_maxwell_han(const std::string & text, const std::vector<size_t> & offsets) {
+    const auto cpts = unicode_cpts_from_utf8(text);
+    return unicode_regex_split_isolated(cpts, offsets, [&](size_t pos, size_t end) -> size_t {
+        size_t p = pos;
+        const auto flags = unicode_cpt_flags_from_cpt(cpts[p]);
+        if (!flags.is_letter && !flags.is_number && p + 1 < end && unicode_cpt_is_han_script(cpts[p + 1])) {
+            p++;
+        }
+        size_t q = p;
+        while (q < end && unicode_cpt_is_han_script(cpts[q])) {
+            q++;
+        }
+        return q > p ? q - pos : 0;
+    });
+}
+
+// regex: [฀-๿຀-໿က-႟ក-៿]+ (Thai, Lao, Myanmar, Khmer)
+static std::vector<size_t> unicode_regex_split_custom_maxwell_sea(const std::string & text, const std::vector<size_t> & offsets) {
+    const auto cpts = unicode_cpts_from_utf8(text);
+    auto is_sea = [](uint32_t c) {
+        return (c >= 0x0E00 && c <= 0x0EFF) || (c >= 0x1000 && c <= 0x109F) || (c >= 0x1780 && c <= 0x17FF);
+    };
+    return unicode_regex_split_isolated(cpts, offsets, [&](size_t pos, size_t end) -> size_t {
+        size_t q = pos;
+        while (q < end && is_sea(cpts[q])) {
+            q++;
+        }
+        return q - pos;
+    });
+}
+
+// regex (GPT-4o style, the leading character may be \r or \n):
+// [^\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|
+// [^\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|
+// \p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// the two word alternatives keep the upper/lower case classes, so a lowercase run ends before the next uppercase letter
+static std::vector<size_t> unicode_regex_split_custom_maxwell_words(const std::string & text, const std::vector<size_t> & offsets) {
+    const auto cpts = unicode_cpts_from_utf8(text);
+
+    return unicode_regex_split_isolated(cpts, offsets, [&](const size_t pos, const size_t end) -> size_t {
+        auto flags = [&](size_t p) {
+            return p < end ? unicode_cpt_flags_from_cpt(cpts[p]) : unicode_cpt_flags{};
+        };
+        // [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] and [\p{Ll}\p{Lm}\p{Lo}\p{M}]
+        auto is_upper_class = [&](size_t p) {
+            const auto f = flags(p);
+            return (f.is_letter && !f.is_lowercase) || f.is_accent_mark;
+        };
+        auto is_lower_class = [&](size_t p) {
+            const auto f = flags(p);
+            return (f.is_letter && !f.is_uppercase) || f.is_accent_mark;
+        };
+        // [\p{Lu}..]*[\p{Ll}..]+ at p, with the backtracking of the greedy first class: the end, or 0
+        auto word_a = [&](size_t p) -> size_t {
+            size_t q = p;
+            while (q < end && is_upper_class(q)) {
+                q++;
+            }
+            size_t r = q;
+            while (r < end && is_lower_class(r)) {
+                r++;
+            }
+            if (r > q) {
+                return r;
+            }
+            for (size_t k = q; k > p; k--) {
+                if (is_lower_class(k - 1)) {
+                    return k;
+                }
+            }
+            return 0;
+        };
+        // [\p{Lu}..]+[\p{Ll}..]* at p (only reached when word_a failed, so the second run is empty)
+        auto word_b = [&](size_t p) -> size_t {
+            size_t q = p;
+            while (q < end && is_upper_class(q)) {
+                q++;
+            }
+            return q > p ? q : 0;
+        };
+        auto contraction = [&](size_t p) -> size_t {
+            if (p >= end || cpts[p] != '\'' || p + 1 >= end) {
+                return p;
+            }
+            const uint32_t c1 = unicode_tolower(cpts[p + 1]);
+            if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') {
+                return p + 2;
+            }
+            if (p + 2 < end) {
+                const uint32_t c2 = unicode_tolower(cpts[p + 2]);
+                if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) {
+                    return p + 3;
+                }
+            }
+            return p;
+        };
+
+        const auto f0 = flags(pos);
+        const bool can_lead = !f0.is_letter && !f0.is_number;
+
+        // the two word alternatives, each first with the optional leading character, then without it
+        for (auto word : { +0, +1 }) {
+            for (int lead = can_lead ? 1 : 0; lead >= 0; lead--) {
+                const size_t p = pos + lead;
+                const size_t e = word == 0 ? word_a(p) : word_b(p);
+                if (e > 0) {
+                    return contraction(e) - pos;
+                }
+            }
+        }
+
+        // \p{N}{1,3}
+        if (f0.is_number) {
+            size_t q = pos;
+            while (q < end && q - pos < 3 && flags(q).is_number) {
+                q++;
+            }
+            return q - pos;
+        }
+
+        // ' ?[^\s\p{L}\p{N}]+[\r\n/]*'
+        {
+            auto is_other = [&](size_t p) {
+                const auto f = flags(p);
+                return p < end && !f.is_whitespace && !f.is_letter && !f.is_number;
+            };
+            size_t q = pos + ((cpts[pos] == ' ' && is_other(pos + 1)) ? 1 : 0);
+            if (is_other(q)) {
+                while (is_other(q)) {
+                    q++;
+                }
+                while (q < end && (cpts[q] == '\r' || cpts[q] == '\n' || cpts[q] == '/')) {
+                    q++;
+                }
+                return q - pos;
+            }
+        }
+
+        // \s*[\r\n]+, \s+(?!\S), \s+
+        size_t q = pos;
+        size_t last_rn = 0;
+        while (q < end && flags(q).is_whitespace) {
+            if (cpts[q] == '\r' || cpts[q] == '\n') {
+                last_rn = q + 1;
+            }
+            q++;
+        }
+        if (last_rn > 0) {
+            return last_rn - pos;
+        }
+        if (q > pos) {
+            if (q < end && q - pos > 1) {
+                return q - 1 - pos;
+            }
+            return q - pos;
+        }
+
+        return 1;
+    });
+}
+
 static std::vector<size_t> unicode_regex_split_custom(const std::string & text, const std::string & regex_expr, const std::vector<size_t> & offsets) {
     std::vector<size_t> bpe_offsets;
 
@@ -1242,6 +1469,14 @@ static std::vector<size_t> unicode_regex_split_custom(const std::string & text, 
     } else if (regex_expr == "\\p{AFMoE_digits}") {
         // AFMOE digit pattern - use custom implementation for proper splitting
         bpe_offsets = unicode_regex_split_custom_afmoe(text, offsets);
+    } else if (regex_expr == "\\n") {
+        bpe_offsets = unicode_regex_split_custom_maxwell_newline(text, offsets);
+    } else if (regex_expr == "[^\\p{L}\\p{N}]?[\\p{Han}]+") {
+        bpe_offsets = unicode_regex_split_custom_maxwell_han(text, offsets);
+    } else if (regex_expr == "[\\u0E00-\\u0E7F\\u0E80-\\u0EFF\\u1000-\\u109F\\u1780-\\u17FF]+") {
+        bpe_offsets = unicode_regex_split_custom_maxwell_sea(text, offsets);
+    } else if (regex_expr == "[^\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+") {
+        bpe_offsets = unicode_regex_split_custom_maxwell_words(text, offsets);
     } else if (regex_expr == "[^\\n]+|[\\n]+") {
         bpe_offsets = unicode_regex_split_custom_newlines(text, offsets);
     } else if (regex_expr == "\\d{1,3}(?=(?:\\d{3})*\\b)") {

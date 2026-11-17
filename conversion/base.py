@@ -2142,6 +2142,9 @@ class TextModel(ModelBase):
         if chkhsh == "a9af07a84191f55098b248ae6f3dfe9e32d3190bebe8eafd91c1ddec9bc3449f":
             # ref: https://huggingface.co/IFM/K2-Horizon-36B
             res = "k2-horizon"
+        if chkhsh == "81a5d106ca83f5e2fada2c5d39b3adb0f83c685e4cf50f16e50752e0cbe91e80":
+            # ref: https://huggingface.co/maxwell-model/Maxwell-V1-Flash
+            res = "maxwell"
 
         if res is None:
             logger.warning("\n")

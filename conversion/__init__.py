@@ -22,6 +22,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "NEOChatModel": "sensenova_u1",
     "AfmoeForCausalLM": "afmoe",
     "LagunaForCausalLM": "laguna",
+    "MaxwellMoeForCausalLM": "maxwell_moe",
     "FlintForCausalLM": "flint",
     "ApertusForCausalLM": "llama",
     "ArceeForCausalLM": "llama",
