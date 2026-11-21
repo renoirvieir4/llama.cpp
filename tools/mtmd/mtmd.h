@@ -563,6 +563,17 @@ struct mtmd_memory_usage {
 MTMD_API struct mtmd_memory_usage mtmd_get_memory_usage(
     const char * mmproj_fname,
     struct mtmd_context_params ctx_params);
+
+// LM Studio's libmtmd ABI (its server and engine import these two): the error message is also stored in *error
+MTMD_API struct mtmd_memory_usage mtmd_get_memory_usage(
+    const char * mmproj_fname,
+    struct mtmd_context_params ctx_params,
+    std::string * error);
+MTMD_API mtmd_context * mtmd_init_from_file_with_error(
+    const char * mmproj_fname,
+    const struct llama_model * text_model,
+    const struct mtmd_context_params ctx_params,
+    std::string * error);
 #endif
 
 //

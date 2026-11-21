@@ -802,6 +802,13 @@ struct mtmd_context {
                     img_end = "</img>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
                 } break;
+            case PROJECTOR_TYPE_INKLING2V:
+                {
+                    // image goes in its own message block (always user role)
+                    img_beg = "<|end_message|><|message_user|><|content_image|>";
+                    img_end = "<|end_message|><|message_user|><|content_text|>";
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_inkling2v>(ctx_v);
+                } break;
             case PROJECTOR_TYPE_MUSE_GLIMMER:
                 {
                     img_beg = "<|image_start|>";
@@ -1258,6 +1265,21 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
         return new mtmd_context(mmproj_fname, text_model, ctx_params);
     } catch (const std::exception & e) {
         LOG_ERR("%s: error: %s\n", __func__, e.what());
+        return nullptr;
+    }
+}
+
+mtmd_context * mtmd_init_from_file_with_error(const char * mmproj_fname,
+        const struct llama_model * text_model,
+        const struct mtmd_context_params ctx_params,
+        std::string * error) {
+    try {
+        return new mtmd_context(mmproj_fname, text_model, ctx_params);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: error: %s\n", __func__, e.what());
+        if (error) {
+            *error = e.what();
+        }
         return nullptr;
     }
 }
@@ -3337,6 +3359,12 @@ static void stub_log_callback(enum ggml_log_level, const char *, void *) {
 
 mtmd_memory_usage mtmd_get_memory_usage(const char * mmproj_fname,
                                         struct mtmd_context_params ctx_params) {
+    return mtmd_get_memory_usage(mmproj_fname, ctx_params, nullptr);
+}
+
+mtmd_memory_usage mtmd_get_memory_usage(const char * mmproj_fname,
+                                        struct mtmd_context_params ctx_params,
+                                        std::string * error) {
     mtmd::context_ptr ctx;
     auto saved_log_callback = g_logger_state.log_callback;
     auto saved_log_user_data = g_logger_state.log_callback_user_data;
@@ -3370,6 +3398,9 @@ mtmd_memory_usage mtmd_get_memory_usage(const char * mmproj_fname,
     } catch (const std::exception & e) {
         mtmd_log_set(saved_log_callback, saved_log_user_data); // restore log callback
         LOG_ERR("%s: error: %s\n", __func__, e.what());
+        if (error) {
+            *error = e.what();
+        }
         return {{}, -1, false};
     }
 }
