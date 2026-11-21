@@ -2537,6 +2537,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     } else if (model.arch == LLM_ARCH_KIMI_K3 || model.arch == LLM_ARCH_GLM5_NEXT || model.arch == LLM_ARCH_RAON1) {
         // the n_tokens*40 budget below is exhausted at ubatch 3840
         res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) {
+        // depth mixing, short convolutions with dynamic taps and the relative bias per layer; the loop reuses its tensors
+        res = std::max<uint32_t>(1024u, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
         // the 128-slot looped graph needs roughly one stack per token budget
         res = std::max<uint32_t>(n_tokens * 80, 64u * model.n_tensors());
@@ -4089,6 +4092,16 @@ llama_context * llama_init_from_model(
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
+    }
+
+    if ((model->arch == LLM_ARCH_INKLING2 || model->arch == LLM_ARCH_INKLING2_LOOP) &&
+            (ggml_is_quantized(params.type_k) || ggml_is_quantized(params.type_v))) {
+        // the per-head relative-position mask runs attention without flash attention (see build_attn_mha), which needs
+        // a plain V cache; the cache is small (the SWA layers keep a 1024-token window)
+        LLAMA_LOG_WARN("%s: %s attention runs without flash attention, using an F16 KV cache instead of K %s / V %s\n",
+                __func__, llm_arch_name(model->arch), ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        params.type_k = GGML_TYPE_F16;
+        params.type_v = GGML_TYPE_F16;
     }
 
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
