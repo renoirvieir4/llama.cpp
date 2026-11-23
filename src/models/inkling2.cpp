@@ -153,6 +153,12 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
         layer.ffn_exp_probs_b  = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B,  "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, 2*n_ff_exp, n_expert}, 0);
         layer.ffn_down_exps    = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+
+        // optional per-expert scales ("<name>.scale", {n_expert}), e.g. NVFP4 scale_2, as written by llama.cpp b12633+
+        // (upstream attaches them in a generic pass, ggml-org/llama.cpp#32669). build_moe_ffn applies up_exps_s to the
+        // fused gate_up product and down_exps_s to the down product. The loop slots copy the layer, scales included.
+        layer.ffn_up_exps_s    = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale",  i), {n_expert}, TENSOR_NOT_REQUIRED);
+        layer.ffn_down_exps_s  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,    "scale",  i), {n_expert}, TENSOR_NOT_REQUIRED);
     }
 }
 
