@@ -12,6 +12,8 @@
 > - answers without a visible `<|end_message|>` in LM Studio;
 > - exact speedups, logits bit-identical: prompts 1.36x at 24K and 1.49x at 98K, generation 1.13x short and 1.33x at 98K
 >   (RTX 3090 x2, 256K context); a 230K-token prompt runs in LM Studio on two 24 GB GPUs.
+> - DFlash2 speculative decoding with incoai/Inkling-2-Mini-DFlash2 as an LM Studio sidecar: 1.47x generation at
+>   temperature 1.0 (draft tokens 7), not worse in mean NLL; logits without a drafter unchanged.
 >
 > **Also on this branch** (Inkling-only changes leave them untouched; 30-model greedy regression identical):
 > - LFM3 Loop (mHC, NVFP4) and the refine loop of [round2-1.7b-loop-preview](https://huggingface.co/notfakerv/round2-1.7b-loop-preview),
