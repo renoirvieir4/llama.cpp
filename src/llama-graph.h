@@ -786,6 +786,21 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
+    // window form, used instead when the ubatch positions span less than n_batch (see set_input_relative_pos_win)
+    ggml_tensor * self_rel_win     = nullptr; // I32 [extent     + n_batch, n_batch]
+    ggml_tensor * self_rel_key     = nullptr; // I32 [n_kv]
+    ggml_tensor * self_rel_win_swa = nullptr; // I32 [extent_swa + n_batch, n_batch]
+    ggml_tensor * self_rel_key_swa = nullptr; // I32 [n_kv_swa]
+
+    // near form, used instead for ubatches below 8 tokens (see set_input_relative_pos_near)
+    ggml_tensor * self_rel_near_cell       = nullptr; // I32 [extent,     n_batch]
+    ggml_tensor * self_rel_near_bucket     = nullptr; // I32 [extent,     n_batch]
+    ggml_tensor * self_rel_near_cell_swa   = nullptr; // I32 [extent_swa, n_batch]
+    ggml_tensor * self_rel_near_bucket_swa = nullptr; // I32 [extent_swa, n_batch]
+
+    static bool use_win(const llama_ubatch & ubatch, const ggml_tensor * kq_mask, uint32_t extent);
+    static bool use_near(const llama_ubatch & ubatch, const ggml_tensor * kq_mask, uint32_t extent, const llama_kv_cache_context * kv);
+
     const uint32_t extent;
     const uint32_t extent_swa;
 };
@@ -1504,6 +1519,45 @@ struct llm_graph_context {
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
             ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
             ggml_tensor * sinks, // [n_head_q]
+                  float   kq_scale,
+                    int   il) const;
+
+    // flash attention with a relative-position bias per head, one stream, no k/v rotation (inkling2)
+    bool can_build_attn_rel_fa(llm_graph_input_mem_hybrid_iswa_rel * inp, int il) const;
+
+    // the same attention without flash attention (soft_max path), the queries split in chunks to bound the dense bias
+    bool can_build_attn_rel_chunked(llm_graph_input_mem_hybrid_iswa_rel * inp, int il) const;
+
+    ggml_tensor * build_attn_rel_chunked(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * q_cur,     // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur,     // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur,     // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * table,     // [n_head_q, n_bucket, n_tokens]
+            ggml_tensor * rel_pos,   // I32 [n_kv, n_tokens], or nullptr with the window form
+            ggml_tensor * table_win, // window form: [n_head_q*n_tokens, n_win + 1]
+            ggml_tensor * rel_key,   // window form: I32 [n_kv]
+            ggml_tensor * near_cell,   // near form instead: I32 [n_near, n_tokens], cell per entry
+            ggml_tensor * near_bucket, // near form: I32 [n_near, n_tokens], bucket per entry
+            ggml_tensor * sinks,     // [n_head_q]
+                  float   kq_scale,
+                    int   il) const;
+
+    ggml_tensor * build_attn_rel_fa(
+            llm_graph_input_mem_hybrid_iswa_rel * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,   // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur,   // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur,   // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * table,   // [n_head_q, n_bucket, n_tokens], bias per head, distance bucket and query
+            ggml_tensor * rel_pos, // I32 [n_kv, n_tokens], distance bucket per key and query
+            ggml_tensor * table_win, // window form instead of rel_pos: [n_head_q*n_tokens, n_win + 1], bias per window position
+            ggml_tensor * rel_key,   // window form: I32 [n_kv], window position per key
+            ggml_tensor * near_cell,   // near form instead: I32 [n_near, n_tokens], cell per entry
+            ggml_tensor * near_bucket, // near form: I32 [n_near, n_tokens], bucket per entry
+            ggml_tensor * sinks,   // [n_head_q], all zero
                   float   kq_scale,
                     int   il) const;
 

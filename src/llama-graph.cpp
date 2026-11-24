@@ -1363,6 +1363,46 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     if (self_rel_pos_swa && self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
     }
+
+    if (self_rel_win && self_rel_win->buffer) {
+        attn_ctx->get_base()->set_input_relative_pos_win(self_rel_win, self_rel_key, ubatch, extent);
+    }
+
+    if (self_rel_win_swa && self_rel_win_swa->buffer) {
+        attn_ctx->get_swa()->set_input_relative_pos_win(self_rel_win_swa, self_rel_key_swa, ubatch, extent_swa);
+    }
+
+    if (self_rel_near_cell && self_rel_near_cell->buffer) {
+        attn_ctx->get_base()->set_input_relative_pos_near(self_rel_near_cell, self_rel_near_bucket, ubatch, extent);
+    }
+
+    if (self_rel_near_cell_swa && self_rel_near_cell_swa->buffer) {
+        attn_ctx->get_swa()->set_input_relative_pos_near(self_rel_near_cell_swa, self_rel_near_bucket_swa, ubatch, extent_swa);
+    }
+}
+
+// the near form: ubatches below 8 tokens with at most extent near cells per token, once the view has at least twice that
+bool llm_graph_input_mem_hybrid_iswa_rel::use_near(const llama_ubatch & ubatch, const ggml_tensor * kq_mask, uint32_t extent, const llama_kv_cache_context * kv) {
+    if (kq_mask->ne[3] != 1 || ubatch.n_tokens == 0 || ubatch.n_tokens >= 8 || kq_mask->ne[0] < 2*(int64_t) extent) {
+        return false;
+    }
+    const int32_t n = kv->count_relative_near(&ubatch, extent);
+    return n >= 0 && n <= (int32_t) extent;
+}
+
+// the window form needs one stream and positions that span less than the ubatch; it pays off for prompt ubatches
+// once the cells are at least twice the window (results are identical either way)
+bool llm_graph_input_mem_hybrid_iswa_rel::use_win(const llama_ubatch & ubatch, const ggml_tensor * kq_mask, uint32_t extent) {
+    if (kq_mask->ne[3] != 1 || ubatch.n_tokens < 8 || kq_mask->ne[0] < 2*((int64_t) extent + ubatch.n_tokens)) {
+        return false;
+    }
+    llama_pos p_min = ubatch.pos[0];
+    llama_pos p_max = ubatch.pos[0];
+    for (uint32_t i = 1; i < ubatch.n_tokens; ++i) {
+        p_min = std::min(p_min, ubatch.pos[i]);
+        p_max = std::max(p_max, ubatch.pos[i]);
+    }
+    return int64_t(p_max) - p_min < (int64_t) ubatch.n_tokens;
 }
 
 bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
@@ -1370,11 +1410,43 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     const auto * attn_ctx = mctx->get_attn();
 
-    res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
-    res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
+    if (!res) {
+        return false;
+    }
 
-    res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
-    res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+    const bool fast_base = !cparams.training && !inp_attn->self_k_rot     && !inp_attn->self_v_rot;
+    const bool fast_swa  = !cparams.training && !inp_attn->self_k_rot_swa && !inp_attn->self_v_rot_swa;
+
+    const bool win      = fast_base && use_win(params.ubatch, inp_attn->self_kq_mask,     extent);
+    const bool win_swa  = fast_swa  && use_win(params.ubatch, inp_attn->self_kq_mask_swa, extent_swa);
+    const bool near     = fast_base && !win     && use_near(params.ubatch, inp_attn->self_kq_mask,     extent,     attn_ctx->get_base());
+    const bool near_swa = fast_swa  && !win_swa && use_near(params.ubatch, inp_attn->self_kq_mask_swa, extent_swa, attn_ctx->get_swa());
+    if (win != (self_rel_win != nullptr) || win_swa != (self_rel_win_swa != nullptr) ||
+        near != (self_rel_near_cell != nullptr) || near_swa != (self_rel_near_cell_swa != nullptr)) {
+        return false;
+    }
+
+    if (near) {
+        res &= self_rel_near_cell->ne[0] == extent && self_rel_near_cell->ne[1] == params.ubatch.n_tokens;
+    } else if (win) {
+        res &= self_rel_key->ne[0] == attn_ctx->get_base()->get_n_kv();
+        res &= self_rel_win->ne[0] == extent + params.ubatch.n_tokens;
+        res &= self_rel_win->ne[1] == params.ubatch.n_tokens;
+    } else {
+        res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
+        res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
+    }
+
+    if (near_swa) {
+        res &= self_rel_near_cell_swa->ne[0] == extent_swa && self_rel_near_cell_swa->ne[1] == params.ubatch.n_tokens;
+    } else if (win_swa) {
+        res &= self_rel_key_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+        res &= self_rel_win_swa->ne[0] == extent_swa + params.ubatch.n_tokens;
+        res &= self_rel_win_swa->ne[1] == params.ubatch.n_tokens;
+    } else {
+        res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+        res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+    }
 
     return res;
 }
@@ -4185,13 +4257,54 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
 
-    inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
-    ggml_set_input(inp->self_rel_pos);
-    ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
+    // the window and near forms only where build_attn_rel_chunked / build_attn_rel_fa run (no k/v rotation, no training)
+    const auto * ia = inp->get_attn();
+    const bool fast_base = !cparams.training && !ia->self_k_rot     && !ia->self_v_rot;
+    const bool fast_swa  = !cparams.training && !ia->self_k_rot_swa && !ia->self_v_rot_swa;
 
-    inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
-    ggml_set_input(inp->self_rel_pos_swa);
-    ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+    if (fast_base && llm_graph_input_mem_hybrid_iswa_rel::use_near(ubatch, inp->get_attn()->self_kq_mask, extent, attn_ctx->get_base())) {
+        inp->self_rel_near_cell = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, extent, ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_near_cell);
+        ggml_set_name(inp->self_rel_near_cell, "attn_inp_rel_near_cell");
+
+        inp->self_rel_near_bucket = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, extent, ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_near_bucket);
+        ggml_set_name(inp->self_rel_near_bucket, "attn_inp_rel_near_bucket");
+    } else if (fast_base && llm_graph_input_mem_hybrid_iswa_rel::use_win(ubatch, inp->get_attn()->self_kq_mask, extent)) {
+        inp->self_rel_win = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, extent + ubatch.n_tokens, ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_win);
+        ggml_set_name(inp->self_rel_win, "attn_inp_rel_win");
+
+        inp->self_rel_key = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv());
+        ggml_set_input(inp->self_rel_key);
+        ggml_set_name(inp->self_rel_key, "attn_inp_rel_key");
+    } else {
+        inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_pos);
+        ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
+    }
+
+    if (fast_swa && llm_graph_input_mem_hybrid_iswa_rel::use_near(ubatch, inp->get_attn()->self_kq_mask_swa, extent_swa, attn_ctx->get_swa())) {
+        inp->self_rel_near_cell_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, extent_swa, ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_near_cell_swa);
+        ggml_set_name(inp->self_rel_near_cell_swa, "attn_inp_rel_near_cell_swa");
+
+        inp->self_rel_near_bucket_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, extent_swa, ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_near_bucket_swa);
+        ggml_set_name(inp->self_rel_near_bucket_swa, "attn_inp_rel_near_bucket_swa");
+    } else if (fast_swa && llm_graph_input_mem_hybrid_iswa_rel::use_win(ubatch, inp->get_attn()->self_kq_mask_swa, extent_swa)) {
+        inp->self_rel_win_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, extent_swa + ubatch.n_tokens, ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_win_swa);
+        ggml_set_name(inp->self_rel_win_swa, "attn_inp_rel_win_swa");
+
+        inp->self_rel_key_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv());
+        ggml_set_input(inp->self_rel_key_swa);
+        ggml_set_name(inp->self_rel_key_swa, "attn_inp_rel_key_swa");
+    } else {
+        inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_pos_swa);
+        ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+    }
 
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
@@ -4221,6 +4334,273 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(kq_mask, "kq_mask_rel_pos", il);
 
     return build_attn(inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, sinks, nullptr, kq_scale, il, kq_mask);
+}
+
+bool llm_graph_context::can_build_attn_rel_fa(llm_graph_input_mem_hybrid_iswa_rel * inp, int il) const {
+    const bool is_swa = hparams.is_swa(il);
+    const auto * inp_attn = inp->get_attn();
+    const ggml_tensor * kq_mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
+
+    return cparams.flash_attn && !cparams.training && kq_mask->ne[3] == 1 && kq_mask->type == GGML_TYPE_F16 &&
+           !(is_swa ? inp_attn->self_k_rot_swa : inp_attn->self_k_rot) &&
+           !(is_swa ? inp_attn->self_v_rot_swa : inp_attn->self_v_rot);
+}
+
+// budget of one dense F32 [n_kv, chunk, n_head] attention tensor (inkling2); env LLAMA_INKLING_ATTN_CHUNK_MIB
+static int64_t inkling_attn_chunk_bytes() {
+    static const int64_t bytes = [] {
+        const char * env = getenv("LLAMA_INKLING_ATTN_CHUNK_MIB");
+        const int64_t mib = env ? std::max(1, atoi(env)) : 512;
+        return mib << 20;
+    }();
+    return bytes;
+}
+
+// queries per attention chunk (inkling2). CUDA picks the KQ / KQV kernel by the number of query columns (one kernel up to 16,
+// cuBLAS above), and the kernels round differently. So ubatches up to 32 tokens are never split (as before the chunking),
+// and larger ones are split evenly into chunks of at least 34 tokens, which keeps every chunk above 16.
+static int64_t inkling_attn_chunk_tokens(int64_t n_tok, int64_t n_kv, int64_t n_head) {
+    if (n_tok <= 32) {
+        return n_tok;
+    }
+    const int64_t fit      = inkling_attn_chunk_bytes()/(n_kv*n_head*(int64_t) sizeof(float));
+    const int64_t nt_max   = std::max<int64_t>(34, fit);
+    const int64_t n_chunks = (n_tok + nt_max - 1)/nt_max;
+    return (n_tok + n_chunks - 1)/n_chunks;
+}
+
+// the gathered bias of queries [t0, t0 + nt) as [n_kv, n_head, nt], key fastest; both forms end in the tiled transpose copy
+static ggml_tensor * inkling_bias_chunk(ggml_context * ctx0, ggml_tensor * table, ggml_tensor * rel_pos, ggml_tensor * table_win,
+        ggml_tensor * rel_key, ggml_tensor * near_cell, ggml_tensor * near_bucket, int64_t n_head, int64_t n_kv, int64_t t0, int64_t nt) {
+    if (near_cell) {
+        // the far bucket everywhere, then the near cells: copies of the same table values as the gather
+        ggml_tensor * tbl    = ggml_view_3d(ctx0, table, table->ne[0], table->ne[1], nt, table->nb[1], table->nb[2], t0*table->nb[2]);
+        ggml_tensor * far    = ggml_view_3d(ctx0, tbl, n_head, 1, nt, tbl->nb[1], tbl->nb[2], (table->ne[1] - 1)*tbl->nb[1]);
+        ggml_tensor * cell   = ggml_view_2d(ctx0, near_cell,   near_cell->ne[0],   nt, near_cell->nb[1],   t0*near_cell->nb[1]);
+        ggml_tensor * bucket = ggml_view_2d(ctx0, near_bucket, near_bucket->ne[0], nt, near_bucket->nb[1], t0*near_bucket->nb[1]);
+        ggml_tensor * g = ggml_repeat_4d(ctx0, far, n_head, n_kv, nt, 1);
+        g = ggml_set_rows(ctx0, g, ggml_get_rows(ctx0, tbl, bucket), cell); // [n_head, n_kv, nt]
+        return ggml_cont(ctx0, ggml_permute(ctx0, g, 1, 0, 2, 3));
+    }
+    if (table_win) {
+        ggml_tensor * tbl = ggml_view_2d(ctx0, table_win, n_head*nt, table_win->ne[1], table_win->nb[1], t0*n_head*table_win->nb[0]);
+        ggml_tensor * g = ggml_get_rows(ctx0, tbl, rel_key); // [n_head*nt, n_kv]
+        return ggml_reshape_3d(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, g)), n_kv, n_head, nt);
+    }
+    ggml_tensor * idx = ggml_view_2d(ctx0, rel_pos, n_kv, nt, rel_pos->nb[1], t0*rel_pos->nb[1]);
+    ggml_tensor * tbl = ggml_view_3d(ctx0, table, table->ne[0], table->ne[1], nt, table->nb[1], table->nb[2], t0*table->nb[2]);
+    ggml_tensor * g = ggml_get_rows(ctx0, tbl, idx); // [n_head, n_kv, nt]
+    return ggml_cont(ctx0, ggml_permute(ctx0, g, 1, 0, 2, 3));
+}
+
+// one query token: build_attn_mha's soft_max path, with the n_gqa q heads of a kv head as the columns of one KQ product,
+// so each K head is read once. KQ stays on the same CUDA kernel (mul_mat_f) as with one column; KQV keeps one column per
+// head (mul_mat_vec_f), as in build_attn_mha.
+static ggml_tensor * inkling_attn_one_token(ggml_context * ctx0, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+        ggml_tensor * mask, ggml_tensor * sinks, float kq_scale) {
+    const int64_t n_embd_head = q->ne[0];
+    const int64_t n_head      = q->ne[1];
+    const int64_t n_head_kv   = k->ne[1];
+    const int64_t n_gqa       = n_head/n_head_kv;
+    const int64_t n_kv        = k->ne[2];
+    GGML_ASSERT(q->ne[2] == 1 && n_gqa*n_head_kv == n_head && ggml_is_contiguous(q));
+
+    GGML_ASSERT(v->nb[1] > v->nb[2]); // v transposed in the cache (no flash attention), as build_attn_mha's soft_max path expects
+
+    // q head h = g + n_gqa*kv
+    ggml_tensor * qg = ggml_view_3d(ctx0, q, n_embd_head, n_gqa, n_head_kv, q->nb[1], n_gqa*q->nb[1], 0);
+    k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+    ggml_tensor * kq = ggml_mul_mat(ctx0, k, qg); // [n_kv, n_gqa, n_head_kv]
+    ggml_prec_set_acc(kq, GGML_PREC_F32);
+
+    kq = ggml_soft_max_ext(ctx0, kq, ggml_reshape_3d(ctx0, mask, n_kv, n_gqa, n_head_kv), kq_scale, 0.0f);
+    ggml_soft_max_add_sinks(kq, ggml_view_1d(ctx0, sinks, n_head_kv, 0));
+    kq = ggml_reshape_3d(ctx0, kq, n_kv, 1, n_head);
+
+    ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq); // [n_embd_head, 1, n_head]
+
+    return ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3)), n_embd_head*n_head, 1);
+}
+
+bool llm_graph_context::can_build_attn_rel_chunked(llm_graph_input_mem_hybrid_iswa_rel * inp, int il) const {
+    const bool is_swa = hparams.is_swa(il);
+    const auto * inp_attn = inp->get_attn();
+    const ggml_tensor * kq_mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
+
+    return !cparams.flash_attn && !cparams.training && kq_mask->ne[3] == 1 &&
+           !(is_swa ? inp_attn->self_k_rot_swa : inp_attn->self_k_rot) &&
+           !(is_swa ? inp_attn->self_v_rot_swa : inp_attn->self_v_rot);
+}
+
+// Same ops as build_attn() with a per-head mask, per chunk of queries; with one chunk the graph computes the same values.
+ggml_tensor * llm_graph_context::build_attn_rel_chunked(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * table,
+        ggml_tensor * rel_pos,
+        ggml_tensor * table_win,
+        ggml_tensor * rel_key,
+        ggml_tensor * near_cell,
+        ggml_tensor * near_bucket,
+        ggml_tensor * sinks,
+            float     kq_scale,
+            int       il) const {
+    const bool is_swa = hparams.is_swa(il);
+
+    auto * inp_attn = inp->get_attn();
+    const auto * mctx_cur = is_swa ? inp_attn->mctx->get_swa() : inp_attn->mctx->get_base();
+
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, k_cur);
+    ggml_build_forward_expand(gf, v_cur);
+
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, is_swa ? inp_attn->get_k_idxs_swa() : inp_attn->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, is_swa ? inp_attn->get_v_idxs_swa() : inp_attn->get_v_idxs(), il));
+
+    ggml_tensor * kq_mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
+    if (kq_mask->type != GGML_TYPE_F32) {
+        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+    }
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    const int64_t n_head = q_cur->ne[1];
+    const int64_t n_tok  = q_cur->ne[2];
+    const int64_t n_kv   = k->ne[2];
+    GGML_ASSERT(near_cell ? near_cell->ne[1] == n_tok : table_win ? rel_key->ne[0] == n_kv : rel_pos->ne[0] == n_kv && rel_pos->ne[1] == n_tok);
+
+    const int64_t n_chunk = inkling_attn_chunk_tokens(n_tok, n_kv, n_head);
+
+    ggml_tensor * out = nullptr;
+    for (int64_t t0 = 0; t0 < n_tok; t0 += n_chunk) {
+        const int64_t nt = std::min(n_chunk, n_tok - t0);
+
+        // the bias [n_kv, n_head, nt]; the add with the mask writes [n_kv, nt, n_head]
+        ggml_tensor * kq_b = inkling_bias_chunk(ctx0, table, rel_pos, table_win, rel_key, near_cell, near_bucket, n_head, n_kv, t0, nt);
+        cb(kq_b, "kq_b", il);
+
+        ggml_tensor * mask = nt == n_tok ? kq_mask : ggml_view_2d(ctx0, kq_mask, n_kv, nt, kq_mask->nb[1], t0*kq_mask->nb[1]);
+        mask = ggml_add(ctx0, ggml_permute(ctx0, kq_b, 0, 2, 1, 3), mask);
+        cb(mask, "kq_mask_rel_pos", il);
+
+        ggml_tensor * q = nt == n_tok ? q_cur : ggml_view_3d(ctx0, q_cur, q_cur->ne[0], n_head, nt, q_cur->nb[1], q_cur->nb[2], t0*q_cur->nb[2]);
+        // one K read per kv head pays off from about 20K cells (measured on RTX 3090); both paths give the same values
+        const bool one_token = nt == 1 && n_kv >= 20480 && k->ne[1] > 1 && n_head > k->ne[1] && v->nb[1] > v->nb[2] &&
+                !hparams.attn_soft_cap && hparams.f_max_alibi_bias == 0.0f && ggml_is_contiguous(q);
+        ggml_tensor * cur = one_token ?
+                inkling_attn_one_token(ctx0, q, k, v, mask, sinks, kq_scale) :
+                build_attn_mha(q, k, v, nullptr, mask, sinks, nullptr, 0, kq_scale, il);
+
+        out = out ? ggml_concat(ctx0, out, cur, 1) : cur;
+    }
+    cb(out, "kqv_out", il);
+
+    return out;
+}
+
+// The flash attention kernels read one mask per sequence (dim 3), not per head. So q head g + n_gqa*k of every kv group k
+// runs as "sequence" k of call g, with its own mask. The queries are split in chunks, so the per-head masks stay small.
+ggml_tensor * llm_graph_context::build_attn_rel_fa(
+        llm_graph_input_mem_hybrid_iswa_rel * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * table,
+        ggml_tensor * rel_pos,
+        ggml_tensor * table_win,
+        ggml_tensor * rel_key,
+        ggml_tensor * near_cell,
+        ggml_tensor * near_bucket,
+        ggml_tensor * sinks,
+            float     kq_scale,
+            int       il) const {
+    const bool is_swa = hparams.is_swa(il);
+
+    auto * inp_attn = inp->get_attn();
+    const auto * mctx_cur = is_swa ? inp_attn->mctx->get_swa() : inp_attn->mctx->get_base();
+
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, k_cur);
+    ggml_build_forward_expand(gf, v_cur);
+
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, is_swa ? inp_attn->get_k_idxs_swa() : inp_attn->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, is_swa ? inp_attn->get_v_idxs_swa() : inp_attn->get_v_idxs(), il));
+
+    ggml_tensor * kq_mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il); // [n_embd_head, n_head_kv, n_kv, 1]
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il); // same layout: v is not transposed with flash attention
+    GGML_ASSERT(v->nb[1] <= v->nb[2]);
+
+    const int64_t n_embd_head = q_cur->ne[0];
+    const int64_t n_head      = q_cur->ne[1];
+    const int64_t n_tok       = q_cur->ne[2];
+    const int64_t n_head_kv   = k->ne[1];
+    const int64_t n_kv        = k->ne[2];
+    const int64_t n_gqa       = n_head/n_head_kv;
+    GGML_ASSERT(n_gqa*n_head_kv == n_head && table->ne[0] == n_head);
+    GGML_ASSERT(near_cell ? near_cell->ne[1] == n_tok : table_win ? rel_key->ne[0] == n_kv && table_win->ne[0] == n_head*n_tok : rel_pos->ne[0] == n_kv && rel_pos->ne[1] == n_tok);
+
+    // kv head k as sequence k
+    ggml_tensor * k_seq = ggml_view_4d(ctx0, k, k->ne[0], n_kv, 1, n_head_kv, k->nb[2], k->nb[2]*n_kv, k->nb[1], 0);
+    ggml_tensor * v_seq = ggml_view_4d(ctx0, v, v->ne[0], n_kv, 1, n_head_kv, v->nb[2], v->nb[2]*n_kv, v->nb[1], 0);
+
+    // queries per chunk, so that the F32 bias of a chunk is at most the chunk budget
+    const int64_t n_chunk = std::max<int64_t>(1, std::min<int64_t>(n_tok, inkling_attn_chunk_bytes()/(n_kv*n_head*(int64_t) sizeof(float))));
+
+    ggml_tensor * out = nullptr;
+    for (int64_t t0 = 0; t0 < n_tok; t0 += n_chunk) {
+        const int64_t nt = std::min(n_chunk, n_tok - t0);
+
+        // bias plus the causal / window / sequence mask, head h = g + n_gqa*k -> F16 [n_kv, nt, n_head_kv (k), n_gqa (g)]
+        // the mask is 0 or -inf, so adding it after the F16 cast is exact
+        ggml_tensor * bias = inkling_bias_chunk(ctx0, table, rel_pos, table_win, rel_key, near_cell, near_bucket, n_head, n_kv, t0, nt);
+        bias = ggml_reshape_4d(ctx0, bias, n_kv, n_gqa, n_head_kv, nt);
+        bias = ggml_cast(ctx0, ggml_permute(ctx0, bias, 0, 3, 2, 1), GGML_TYPE_F16);
+        bias = ggml_add(ctx0, bias, ggml_view_2d(ctx0, kq_mask, n_kv, nt, kq_mask->nb[1], t0*kq_mask->nb[1]));
+        cb(bias, "kq_mask_rel_pos_fa", il);
+
+        ggml_tensor * heads = nullptr; // [n_embd_head, g, nt, k]
+        for (int64_t g = 0; g < n_gqa; ++g) {
+            ggml_tensor * q_g = ggml_view_4d(ctx0, q_cur, n_embd_head, nt, 1, n_head_kv,
+                    q_cur->nb[2], q_cur->nb[2]*nt, n_gqa*q_cur->nb[1], g*q_cur->nb[1] + t0*q_cur->nb[2]);
+            ggml_tensor * m_g = ggml_view_4d(ctx0, bias, n_kv, nt, 1, n_head_kv, bias->nb[1], bias->nb[1]*nt, bias->nb[2], g*bias->nb[3]);
+
+            ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q_g, k_seq, v_seq, m_g, kq_scale, 0.0f, 0.0f);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+            // one head per call; the sinks are zero (the sink logit is in the bias), so one entry serves every head
+            ggml_flash_attn_ext_add_sinks(cur, ggml_view_1d(ctx0, sinks, 1, 0));
+            ggml_flash_attn_ext_set_n_kv_max(cur, 0);
+            ggml_prec_set_acc(cur, GGML_PREC_F32);
+
+            heads = heads ? ggml_concat(ctx0, heads, cur, 1) : cur;
+        }
+
+        // [n_embd_head, g, k, nt] -> [n_embd_head*n_head, nt]
+        heads = ggml_cont(ctx0, ggml_permute(ctx0, heads, 0, 1, 3, 2));
+        heads = ggml_reshape_2d(ctx0, heads, n_embd_head*n_head, nt);
+
+        out = out ? ggml_concat(ctx0, out, heads, 1) : heads;
+    }
+    cb(out, "kqv_out", il);
+
+    if (wo) {
+        out = build_lora_mm(wo, out, wo_s);
+    }
+
+    if (wo_b) {
+        out = ggml_add(ctx0, out, wo_b);
+    }
+
+    return out;
 }
 
 void llm_graph_context::build_dense_out(

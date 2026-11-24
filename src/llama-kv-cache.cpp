@@ -1824,6 +1824,121 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
+// window form of set_input_relative_pos, for a ubatch of one stream with max(pos) - min(pos) < n_tokens:
+// dst_win I32 [n_win + 1, n_tokens]: bucket of window position w (p0 + w) for each token, row n_win is the far row (extent)
+// dst_key I32 [n_kv]: window position of each cell, n_win for the empty cells and the cells outside the window
+// the bucket of cell j for token i is dst_win[dst_key[j], i], which equals set_input_relative_pos
+void llama_kv_cache::set_input_relative_pos_win(ggml_tensor * dst_win, ggml_tensor * dst_key, const llama_ubatch * ubatch, uint32_t extent) const {
+    GGML_ASSERT(dst_win->type == GGML_TYPE_I32 && dst_key->type == GGML_TYPE_I32);
+
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_win    = dst_win->ne[0] - 1;
+    const int64_t n_kv     = dst_key->ne[0];
+    GGML_ASSERT(dst_win->ne[1] == n_tokens);
+
+    int64_t p_min = ubatch->pos[0];
+    int64_t p_max = ubatch->pos[0];
+    for (int64_t i = 1; i < n_tokens; ++i) {
+        p_min = std::min<int64_t>(p_min, ubatch->pos[i]);
+        p_max = std::max<int64_t>(p_max, ubatch->pos[i]);
+    }
+    GGML_ASSERT(p_max - p_min + (int64_t) extent <= n_win);
+    const int64_t p0 = p_min - extent + 1;
+
+    std::vector<int32_t> win((n_win + 1) * n_tokens);
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        for (int64_t w = 0; w < n_win; ++w) {
+            const int64_t distance = int64_t(ubatch->pos[i]) - (p0 + w);
+            win[i*(n_win + 1) + w] = distance >= 0 && distance < extent ? distance : extent;
+        }
+        win[i*(n_win + 1) + n_win] = extent;
+    }
+
+    const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[0][0]));
+    std::vector<int32_t> key(n_kv);
+    for (int64_t j = 0; j < n_kv; ++j) {
+        const int64_t w = cells.is_empty(j) ? -1 : cells.pos_get(j) - p0;
+        key[j] = w >= 0 && w < n_win ? w : n_win;
+    }
+
+    ggml_backend_tensor_set(dst_win, win.data(), 0, ggml_nbytes(dst_win));
+    ggml_backend_tensor_set(dst_key, key.data(), 0, ggml_nbytes(dst_key));
+}
+
+// near form of set_input_relative_pos for small ubatches. Only the cells that the KQ mask keeps for a token (same sequence,
+// not in the future) need their bucket; of those, the cells at a distance below extent are "near", the others get the far
+// bucket (extent), as do all the masked cells. count_relative_near: the largest number of near cells of a token in the
+// view [0, n_kv), or -1 when the form does not apply (more than one stream, a token in several sequences).
+int32_t llama_kv_cache::count_relative_near(const llama_ubatch * ubatch, uint32_t extent, uint32_t n_kv) const {
+
+    int32_t res = 0;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        if (ubatch->n_seq_id[i] != 1 || seq_to_stream.at(ubatch->seq_id[i][0]) != seq_to_stream.at(ubatch->seq_id[0][0])) {
+            return -1;
+        }
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        const auto & cells = v_cells.at(seq_to_stream.at(seq_id));
+        const int64_t p1 = ubatch->pos[i];
+
+        int32_t n = 0;
+        for (uint32_t j = 0; j < n_kv; ++j) {
+            if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+                const int64_t distance = p1 - cells.pos_get(j);
+                n += distance >= 0 && distance < extent;
+            }
+        }
+        res = std::max(res, n);
+    }
+
+    return res;
+}
+
+// dst_cell, dst_bucket I32 [n_near, n_tokens]: the near cells of each token and their buckets; the remaining entries are
+// other cells of the view with the far bucket, so every entry of a token targets a different cell
+void llama_kv_cache::set_input_relative_pos_near(ggml_tensor * dst_cell, ggml_tensor * dst_bucket, const llama_ubatch * ubatch, uint32_t extent, uint32_t n_kv_view) const {
+    GGML_ASSERT(dst_cell->type == GGML_TYPE_I32 && dst_bucket->type == GGML_TYPE_I32);
+
+    const int64_t n_near   = dst_cell->ne[0];
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t n_kv     = n_kv_view;
+    GGML_ASSERT(dst_cell->ne[1] == n_tokens && dst_bucket->ne[0] == n_near && dst_bucket->ne[1] == n_tokens && n_kv >= 2*n_near);
+
+    std::vector<int32_t> cell(n_near*n_tokens);
+    std::vector<int32_t> bucket(n_near*n_tokens);
+    std::vector<uint8_t> used(n_kv);
+
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+        const auto & cells = v_cells.at(seq_to_stream.at(seq_id));
+        const int64_t p1 = ubatch->pos[i];
+
+        std::fill(used.begin(), used.end(), 0);
+        int64_t n = 0;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
+                const int64_t distance = p1 - cells.pos_get(j);
+                if (distance >= 0 && distance < extent) {
+                    GGML_ASSERT(n < n_near);
+                    cell  [i*n_near + n] = j;
+                    bucket[i*n_near + n] = distance;
+                    used[j] = 1;
+                    ++n;
+                }
+            }
+        }
+        for (int64_t j = 0; n < n_near; ++j) {
+            if (!used[j]) {
+                cell  [i*n_near + n] = j;
+                bucket[i*n_near + n] = extent;
+                ++n;
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(dst_cell,   cell.data(),   0, ggml_nbytes(dst_cell));
+    ggml_backend_tensor_set(dst_bucket, bucket.data(), 0, ggml_nbytes(dst_bucket));
+}
+
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
@@ -2948,6 +3063,18 @@ void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama
 
 void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
     kv->set_input_relative_pos(dst, ubatch, extent);
+}
+
+void llama_kv_cache_context::set_input_relative_pos_win(ggml_tensor * dst_win, ggml_tensor * dst_key, const llama_ubatch * ubatch, uint32_t extent) const {
+    kv->set_input_relative_pos_win(dst_win, dst_key, ubatch, extent);
+}
+
+int32_t llama_kv_cache_context::count_relative_near(const llama_ubatch * ubatch, uint32_t extent) const {
+    return kv->count_relative_near(ubatch, extent, get_n_kv());
+}
+
+void llama_kv_cache_context::set_input_relative_pos_near(ggml_tensor * dst_cell, ggml_tensor * dst_bucket, const llama_ubatch * ubatch, uint32_t extent) const {
+    kv->set_input_relative_pos_near(dst_cell, dst_bucket, ubatch, extent, get_n_kv());
 }
 
 void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {

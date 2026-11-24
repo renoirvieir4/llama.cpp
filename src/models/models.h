@@ -7,6 +7,7 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <map>
+#include <tuple>
 
 class llama_memory_hybrid_idx_context;
 
@@ -2545,6 +2546,13 @@ struct llama_model_inkling2 : public llama_model_base {
 
         ggml_tensor * inp_out_ids = nullptr;
         ggml_tensor * tau         = nullptr; // log-scaled positions
+
+        // built once per graph and shared by the layers: the same values as building them per layer
+        std::map<std::tuple<int64_t, int64_t, float>, ggml_tensor *> clip_thresholds; // [1, ne1, ne2] filled with a threshold
+        std::map<int64_t, ggml_tensor *> zero_sinks;                                    // [n_head] zeros
+        std::map<const ggml_tensor *, ggml_tensor *> rel_bias_padded;                   // attn_rel_bias with the zero far bucket
+        std::vector<ggml_tensor *> stack_blocks;                                        // the blocks in stack
+        ggml_tensor * stack = nullptr;                                                  // [n_embd, k, n_tokens]: blocks k-1 .. 0
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

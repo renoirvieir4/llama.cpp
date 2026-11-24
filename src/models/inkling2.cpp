@@ -1,6 +1,8 @@
 #include "models.h"
 #include "../llama-memory-hybrid-iswa.h"
 
+#include <algorithm>
+
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
@@ -175,20 +177,36 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
     ggml_tensor * norm = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur)));
     norm = ggml_scale_bias(ctx0, norm, 1.0f, 1e-6f);
 
-    ggml_tensor * factor = ggml_div(ctx0, ggml_fill(ctx0, norm, threshold), norm);
+    ggml_tensor * & fill = clip_thresholds[{norm->ne[1], norm->ne[2], threshold}];
+    if (!fill) {
+        fill = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, norm->type, norm->ne[0], norm->ne[1], norm->ne[2], norm->ne[3]), threshold);
+    }
+    ggml_tensor * factor = ggml_div(ctx0, fill, norm);
 
     return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
 }
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+    // the stack [blocks k-1 .. 0] grows by one concat per new block, then cur goes in front of it once per call
+    if (blocks.size() < stack_blocks.size() || !std::equal(stack_blocks.begin(), stack_blocks.end(), blocks.begin())) {
+        stack_blocks.clear();
+        stack = nullptr;
+    }
+    for (size_t i = stack_blocks.size(); i < blocks.size(); ++i) {
+        ggml_tensor * block = ggml_reshape_3d(ctx0, blocks[i], n_embd, 1, n_tokens);
+        stack = stack ? ggml_concat(ctx0, block, stack, 1) : block;
+        stack_blocks.push_back(blocks[i]);
+    }
     ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
-    for (ggml_tensor * block : blocks) {
-        states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
+    if (stack) {
+        states = ggml_concat(ctx0, stack, states, 1);
     }
     states = ggml_rms_norm(ctx0, states, 1e-6f);
 
-    ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
+    // one token: the query itself, no repeat
+    ggml_tensor * queries = n_tokens == 1 && ggml_is_contiguous(query) ? ggml_reshape_3d(ctx0, query, n_embd, query->ne[1], 1) :
+            ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
 
     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
@@ -353,29 +371,65 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cb(Rcur, "Rcur", il);
 
         ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+        ggml_tensor * rel_win = is_swa ? inp->self_rel_win_swa : inp->self_rel_win;
+        ggml_tensor * rel_key = is_swa ? inp->self_rel_key_swa : inp->self_rel_key;
+        ggml_tensor * near_cell   = is_swa ? inp->self_rel_near_cell_swa   : inp->self_rel_near_cell;
+        ggml_tensor * near_bucket = is_swa ? inp->self_rel_near_bucket_swa : inp->self_rel_near_bucket;
 
         const int64_t n_stream = (is_swa ? attn->get_kq_mask_swa() : attn->get_kq_mask())->ne[3];
-        const int64_t n_kv     = rel_pos->ne[0];
+        const int64_t n_kv     = (is_swa ? attn->get_kq_mask_swa() : attn->get_kq_mask())->ne[0];
 
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
+        // the padded table is the same for every pass of a looped layer
+        ggml_tensor * & rel_bias = rel_bias_padded[layer.attn_rel_bias];
+        if (!rel_bias) {
+            rel_bias = ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0);
+        }
+        ggml_tensor * table = ggml_mul_mat(ctx0, rel_bias, Rcur);
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
         table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 
-        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
-        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
-        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
-        cb(kq_b, "kq_b", il);
+        ggml_tensor * & zero = zero_sinks[n_head];
+        if (!zero) {
+            zero = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        }
+        sinks = zero;
 
-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+        // window form: the bias of each window position first, [n_head*n_tokens, n_win + 1], then one long row per cell
+        ggml_tensor * table_win = nullptr;
+        if (rel_win) {
+            table_win = ggml_get_rows(ctx0, table, rel_win);
+            table_win = ggml_cont(ctx0, ggml_permute(ctx0, table_win, 0, 2, 1, 3));
+            table_win = ggml_reshape_2d(ctx0, table_win, n_head*n_tokens, table_win->ne[2]);
+        }
 
-        cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
+        if (can_build_attn_rel_fa(inp, il)) {
+            cur = build_attn_rel_fa(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, table, rel_pos, table_win, rel_key, near_cell, near_bucket, sinks, 1.0f/sqrtf(n_embd_head), il);
+        } else if (can_build_attn_rel_chunked(inp, il)) {
+            cur = build_attn_rel_chunked(inp, Qcur, Kcur, Vcur, table, rel_pos, table_win, rel_key, near_cell, near_bucket, sinks, 1.0f/sqrtf(n_embd_head), il);
+        } else {
+            ggml_tensor * kq_b;
+            if (table_win) {
+                kq_b = ggml_get_rows(ctx0, table_win, rel_key);
+                kq_b = ggml_reshape_3d(ctx0, kq_b, n_head, n_tokens, n_kv);
+                kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 1, 0, 3));
+            } else {
+                kq_b = ggml_get_rows(ctx0, table, rel_pos);
+                kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+                kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+            }
+            cb(kq_b, "kq_b", il);
+
+            cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
+        }
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);

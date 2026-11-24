@@ -237,6 +237,9 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     // inkling2: distance from each token to each cell of the view, extent for the empty, future and more distant cells
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    void set_input_relative_pos_win(ggml_tensor * dst_win, ggml_tensor * dst_key, const llama_ubatch * ubatch, uint32_t extent) const;
+    int32_t count_relative_near(const llama_ubatch * ubatch, uint32_t extent, uint32_t n_kv) const;
+    void set_input_relative_pos_near(ggml_tensor * dst_cell, ggml_tensor * dst_bucket, const llama_ubatch * ubatch, uint32_t extent, uint32_t n_kv) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -432,6 +435,9 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     // inkling2: distance from each token to each cell of the view, extent for the empty, future and more distant cells
     void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+    void set_input_relative_pos_win(ggml_tensor * dst_win, ggml_tensor * dst_key, const llama_ubatch * ubatch, uint32_t extent) const;
+    int32_t count_relative_near(const llama_ubatch * ubatch, uint32_t extent) const;
+    void set_input_relative_pos_near(ggml_tensor * dst_cell, ggml_tensor * dst_bucket, const llama_ubatch * ubatch, uint32_t extent) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
