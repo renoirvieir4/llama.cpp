@@ -1,8 +1,24 @@
 # llama.cpp
 
 > [!NOTE]
-> **This branch, `round2-1.7b-loop-preview`, is llama.cpp `ff0d396e3` plus support for the looped LFM3 model [round2-1.7b-loop-preview](https://huggingface.co/notfakerv/round2-1.7b-loop-preview).**
-> Build and run recipe: [ROUND2-1.7B-LOOP-PREVIEW.md](ROUND2-1.7B-LOOP-PREVIEW.md), or run `scripts/round2-loop-preview.sh`. Everything below is upstream llama.cpp's README.
+> **This branch, `inkling2-scale`, is llama.cpp `ff0d396e3` plus support for Inkling 2 Mini and other models, built as the
+> `libllama.so` and `libmtmd.so` of LM Studio's Linux CUDA 12 runtime 2.66.0** (it also runs in that runtime's llama-server).
+> Everything below the note is upstream llama.cpp's README.
+>
+> **Inkling 2 Mini** ([thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini); `inkling2`,
+> `inkling2_loop`, vision `inkling2v`), recipe and numbers in [INKLING-2-MINI.md](INKLING-2-MINI.md):
+> - a port of ggml-org/llama.cpp's Inkling 2 support (ggml-org/llama.cpp#32694) to this tree, with the vision encoder and LM Studio's libmtmd entry points;
+> - NVFP4 per-expert `.scale` tensors (llama.cpp b12633+ files);
+> - answers without a visible `<|end_message|>` in LM Studio;
+> - exact speedups, logits bit-identical: prompts 1.36x at 24K and 1.49x at 98K, generation 1.13x short and 1.33x at 98K
+>   (RTX 3090 x2, 256K context); a 230K-token prompt runs in LM Studio on two 24 GB GPUs.
+>
+> **Also on this branch** (Inkling-only changes leave them untouched; 30-model greedy regression identical):
+> - LFM3 Loop (mHC, NVFP4) and the refine loop of [round2-1.7b-loop-preview](https://huggingface.co/notfakerv/round2-1.7b-loop-preview),
+>   recipe in [ROUND2-1.7B-LOOP-PREVIEW.md](ROUND2-1.7B-LOOP-PREVIEW.md);
+> - SenseNova Loop; Clover MoE (ggml-org/llama.cpp#31306, by Maphist0 and contributors); Nemotron Dory (ggml-org/llama.cpp#30306);
+> - Maxwell MoE (AtomicChat's port, from AtomicChat/Maxwell-V1-Flash-GGUF);
+> - Raon-1 mini preview (by KRAFTON's Dong Won Kim and Hyeonghwan Kim), and SiTU in dense feed-forward graphs.
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
