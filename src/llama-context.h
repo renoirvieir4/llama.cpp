@@ -456,10 +456,11 @@ private:
         std::vector<llama_token> role_other;     // user, system, tool
         std::vector<llama_token> content_other;  // thinking, tool invocations, images, xml, tool errors
     } inkling_end;
-    std::map<llama_seq_id, uint8_t> inkling_seq_state; // 0 outside, 1 model message, 2 model text
+    // per sequence, (pos, state after pos) at each change; 0 outside, 1 model message, 2 model text
+    std::map<llama_seq_id, std::vector<std::pair<llama_pos, uint8_t>>> inkling_seq_state;
     std::vector<uint8_t> inkling_row_fold;              // per output row of the last batch: fold the logits
 
     void inkling_end_init();
-    void inkling_end_track(const llama_batch_ext & batch_inp, std::vector<uint8_t> & fold_by_batch_idx);
+    void inkling_end_track(const llama_batch_ext & batch_inp, const llama_pos * pos_inp, std::vector<uint8_t> & fold_by_batch_idx);
     void inkling_end_apply_row(int64_t row);
 };

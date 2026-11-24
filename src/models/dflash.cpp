@@ -33,6 +33,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_DFLASH_CONV_GROUP_SIZE,  hparams.dflash_conv_group_size,  false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_RANK,    hparams.dflash_selector_rank,    false);
     ml.get_key(LLM_KV_DFLASH_SELECTOR_TOP_K,   hparams.dflash_selector_top_k,   false);
+    ml.get_key(LLM_KV_DFLASH_SELECTOR_SOFTCAP_POST, hparams.dflash_selector_softcap_post, false);
     const bool has_lilicorr = ml.get_key(LLM_KV_LILICORR_HIDDEN_SIZE, hparams.lilicorr_hidden_size, false);
     ml.get_key(LLM_KV_LILICORR_CANDIDATE_TOPK, hparams.lilicorr_candidate_topk, has_lilicorr);
     ml.get_key(LLM_KV_LILICORR_NUM_HEADS,      hparams.lilicorr_num_heads,      has_lilicorr);
@@ -49,6 +50,15 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
+    }
+
+    // looped targets (inkling2_loop): target_layers holds the physical layers, target_visits the exact layer visits
+    std::vector<int32_t> target_visits;
+    if (ml.get_arr(LLM_KV_TARGET_VISITS, target_visits, false)) {
+        if (target_visits.size() != target_layer_ids.size()) {
+            throw std::runtime_error("DFlash 'target_visits' and 'target_layers' differ in length");
+        }
+        target_layer_ids = std::move(target_visits);
     }
 
     hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
@@ -617,6 +627,10 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
         }
         ggml_tensor * unary_bcast = ggml_reshape_4d(ctx0, unary_run, top_k, 1, n_pos, n_blocks);
         score = ggml_add(ctx0, score, ggml_repeat(ctx0, unary_bcast, score));
+        if (hparams.dflash_selector_softcap_post && hparams.f_final_logit_softcapping > 0.0f) {
+            const float cap = hparams.f_final_logit_softcapping;
+            score = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, score, 1.0f / cap)), cap);
+        }
 
         ggml_tensor * row = ggml_concat(ctx0,
                 ggml_cast(ctx0, cand_run, GGML_TYPE_F32),
@@ -927,12 +941,20 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // tok_embd from the target model (shared via ctx_other)
     auto * tok_embd = model.tok_embd;
+    // inkling2 drafts embed through the target's token norm, as the target does
+    ggml_tensor * tok_norm     = nullptr;
+    float         tok_norm_eps = 0.0f;
     if (tok_embd == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
         tok_embd = model_other->tok_embd;
+        if (model_other->arch == LLM_ARCH_INKLING2 || model_other->arch == LLM_ARCH_INKLING2_LOOP) {
+            GGML_ASSERT(model_other->tok_norm != nullptr);
+            tok_norm     = model_other->tok_norm;
+            tok_norm_eps = model_other->hparams.f_norm_rms_eps;
+        }
     }
 
     ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
@@ -955,6 +977,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
+    if (tok_norm) {
+        inpL = ggml_mul(ctx0, ggml_rms_norm(ctx0, inpL, tok_norm_eps), tok_norm);
+    }
     if (hparams.f_embedding_scale != 0.0f) {
         inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
     }
@@ -1068,6 +1093,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
         output   = model_other->output;
         output_s = model_other->output_s;
+        // a target head with padded rows (inkling2): keep the rows of the shared vocabulary
+        const int64_t n_vocab = (int64_t) model.vocab.n_tokens();
+        if (!model.d2t && output->ne[1] > n_vocab) {
+            output = ggml_view_2d(ctx0, output, output->ne[0], n_vocab, output->nb[1], 0);
+        }
     }
 
     cur = build_lora_mm(output, cur, output_s);
@@ -1078,7 +1108,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         if (hparams.f_logit_scale != 0.0f) {
             cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
         }
-        if (hparams.f_final_logit_softcapping > 0.0f) {
+        if (hparams.f_final_logit_softcapping > 0.0f && !hparams.dflash_selector_softcap_post) {
             cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
             cur = ggml_tanh(ctx0, cur);
             cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);

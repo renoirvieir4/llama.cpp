@@ -1067,18 +1067,32 @@ void llama_context::inkling_end_init() {
     }
 }
 
-void llama_context::inkling_end_track(const llama_batch_ext & batch_inp, std::vector<uint8_t> & fold_by_batch_idx) {
+void llama_context::inkling_end_track(const llama_batch_ext & batch_inp, const llama_pos * pos_inp, std::vector<uint8_t> & fold_by_batch_idx) {
     const auto & ie = inkling_end;
 
     fold_by_batch_idx.assign(batch_inp.tokens.size(), 0);
 
+    // the state of a sequence comes from the positions before the batch, so tokens
+    // removed from the cache (rejected drafts, re-processed prompts) no longer count
+    std::map<llama_seq_id, uint8_t> cur;
+
     for (size_t i = 0; i < batch_inp.tokens.size(); ++i) {
         const auto & tok = batch_inp.tokens[i];
         const llama_token id = tok.id;
+        const llama_pos pos = pos_inp[i];
 
         bool fold = false;
         for (const llama_seq_id s : tok.seq_ids) {
-            uint8_t & st = inkling_seq_state[s];
+            auto & changes = inkling_seq_state[s];
+            auto it = cur.find(s);
+            if (it == cur.end()) {
+                while (!changes.empty() && changes.back().first >= pos) {
+                    changes.pop_back();
+                }
+                it = cur.emplace(s, changes.empty() ? 0 : changes.back().second).first;
+            }
+            uint8_t & st = it->second;
+            const uint8_t prev = st;
             if (id == ie.role_model) {
                 st = 1;
             } else if (id == ie.content_text) {
@@ -1090,6 +1104,9 @@ void llama_context::inkling_end_track(const llama_batch_ext & batch_inp, std::ve
                 st = st == 0 ? 0 : 1;
             }
             // embedding rows (images) and ordinary tokens keep the state
+            if (st != prev) {
+                changes.emplace_back(pos, st);
+            }
             fold = fold || st == 2;
         }
         fold_by_batch_idx[i] = fold;
@@ -2331,7 +2348,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     if (inkling_end.enabled) {
         std::vector<uint8_t> fold_by_batch_idx;
-        inkling_end_track(batch_inp, fold_by_batch_idx);
+        inkling_end_track(batch_inp, balloc->get_batch().pos, fold_by_batch_idx);
 
         inkling_row_fold.assign(n_outputs, 0);
         for (size_t i = 0; i < fold_by_batch_idx.size() && i < output_ids.size(); ++i) {

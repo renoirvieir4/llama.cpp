@@ -2553,6 +2553,9 @@ struct llama_model_inkling2 : public llama_model_base {
         std::map<const ggml_tensor *, ggml_tensor *> rel_bias_padded;                   // attn_rel_bias with the zero far bucket
         std::vector<ggml_tensor *> stack_blocks;                                        // the blocks in stack
         ggml_tensor * stack = nullptr;                                                  // [n_embd, k, n_tokens]: blocks k-1 .. 0
+
+        // layer visits built so far, in execution order (the DFlash feature ids)
+        int n_visit = 0;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
