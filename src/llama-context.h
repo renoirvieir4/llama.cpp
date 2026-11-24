@@ -444,4 +444,22 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // inkling2: inside model text, fold the <|end_message|> logit into the EOG token, so the answer does not end with a rendered <|end_message|>
+    // env: LLAMA_INKLING_KEEP_END_MESSAGE=1 disables it. Members stay at the end of the struct to keep the layout of the others.
+    struct inkling_end_info {
+        bool        enabled      = false;
+        llama_token end_message  = LLAMA_TOKEN_NULL;
+        llama_token end_sampling = LLAMA_TOKEN_NULL;
+        llama_token role_model   = LLAMA_TOKEN_NULL;
+        llama_token content_text = LLAMA_TOKEN_NULL;
+        std::vector<llama_token> role_other;     // user, system, tool
+        std::vector<llama_token> content_other;  // thinking, tool invocations, images, xml, tool errors
+    } inkling_end;
+    std::map<llama_seq_id, uint8_t> inkling_seq_state; // 0 outside, 1 model message, 2 model text
+    std::vector<uint8_t> inkling_row_fold;              // per output row of the last batch: fold the logits
+
+    void inkling_end_init();
+    void inkling_end_track(const llama_batch_ext & batch_inp, std::vector<uint8_t> & fold_by_batch_idx);
+    void inkling_end_apply_row(int64_t row);
 };

@@ -384,6 +384,8 @@ llama_context::llama_context(
         }
     }
 
+    inkling_end_init();
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -1028,8 +1030,97 @@ enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
+void llama_context::inkling_end_init() {
+    if (model.arch != LLM_ARCH_INKLING2 && model.arch != LLM_ARCH_INKLING2_LOOP) {
+        return;
+    }
+    const char * keep = getenv("LLAMA_INKLING_KEEP_END_MESSAGE");
+    if (keep && atoi(keep) != 0) {
+        return;
+    }
+
+    const auto & vocab = model.vocab;
+    auto & ie = inkling_end;
+
+    ie.end_message  = vocab.text_to_token("<|end_message|>");
+    ie.end_sampling = vocab.text_to_token("<|content_model_end_sampling|>");
+    ie.role_model   = vocab.text_to_token("<|message_model|>");
+    ie.content_text = vocab.text_to_token("<|content_text|>");
+    for (const char * t : {"<|message_user|>", "<|message_system|>", "<|message_tool|>"}) {
+        ie.role_other.push_back(vocab.text_to_token(t));
+    }
+    for (const char * t : {"<|content_thinking|>", "<|content_invoke_tool_json|>", "<|content_invoke_tool_text|>",
+                           "<|content_image|>", "<|content_xml|>", "<|content_tool_error|>"}) {
+        const llama_token id = vocab.text_to_token(t);
+        if (id != LLAMA_TOKEN_NULL) {
+            ie.content_other.push_back(id);
+        }
+    }
+
+    ie.enabled = ie.end_message != LLAMA_TOKEN_NULL && ie.end_sampling != LLAMA_TOKEN_NULL &&
+                 ie.role_model != LLAMA_TOKEN_NULL && ie.content_text != LLAMA_TOKEN_NULL &&
+                 vocab.is_eog(ie.end_sampling) && !vocab.is_eog(ie.end_message) &&
+                 std::find(ie.role_other.begin(), ie.role_other.end(), LLAMA_TOKEN_NULL) == ie.role_other.end();
+
+    if (ie.enabled) {
+        LLAMA_LOG_INFO("%s: inkling2: <|end_message|> at the end of model text is folded into <|content_model_end_sampling|>\n", __func__);
+    }
+}
+
+void llama_context::inkling_end_track(const llama_batch_ext & batch_inp, std::vector<uint8_t> & fold_by_batch_idx) {
+    const auto & ie = inkling_end;
+
+    fold_by_batch_idx.assign(batch_inp.tokens.size(), 0);
+
+    for (size_t i = 0; i < batch_inp.tokens.size(); ++i) {
+        const auto & tok = batch_inp.tokens[i];
+        const llama_token id = tok.id;
+
+        bool fold = false;
+        for (const llama_seq_id s : tok.seq_ids) {
+            uint8_t & st = inkling_seq_state[s];
+            if (id == ie.role_model) {
+                st = 1;
+            } else if (id == ie.content_text) {
+                st = st == 0 ? 0 : 2;
+            } else if (id == ie.end_message || id == ie.end_sampling ||
+                       std::find(ie.role_other.begin(), ie.role_other.end(), id) != ie.role_other.end()) {
+                st = 0;
+            } else if (std::find(ie.content_other.begin(), ie.content_other.end(), id) != ie.content_other.end()) {
+                st = st == 0 ? 0 : 1;
+            }
+            // embedding rows (images) and ordinary tokens keep the state
+            fold = fold || st == 2;
+        }
+        fold_by_batch_idx[i] = fold;
+    }
+}
+
+void llama_context::inkling_end_apply_row(int64_t row) {
+    if (!inkling_end.enabled || row < 0 || (size_t) row >= inkling_row_fold.size() || !inkling_row_fold[row] || logits.data == nullptr) {
+        return;
+    }
+
+    float * l = logits.data + row*model.vocab.n_tokens();
+    float & e = l[inkling_end.end_message];
+    float & s = l[inkling_end.end_sampling];
+
+    // P(stop) = P(<|end_message|>) + P(<|content_model_end_sampling|>); idempotent, so repeated reads are safe
+    if (e != -INFINITY) {
+        const float m = std::max(e, s);
+        s = m + std::log(std::exp(e - m) + std::exp(s - m));
+        e = -INFINITY;
+    }
+}
+
 float * llama_context::get_logits() {
     output_reorder();
+
+    if (inkling_end.enabled) {
+        for (size_t row = 0; row < inkling_row_fold.size(); ++row) {
+            inkling_end_apply_row(row);
+        }
+    }
 
     return logits.data;
 }
@@ -1072,6 +1163,7 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
+        inkling_end_apply_row(j);
         return logits.data + j*model.vocab.n_tokens();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
@@ -2233,6 +2325,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
             for (uint32_t i = 0; i < n_outputs; ++i) {
                 output_ids[out_ids[i]] = i;
+            }
+        }
+    }
+
+    if (inkling_end.enabled) {
+        std::vector<uint8_t> fold_by_batch_idx;
+        inkling_end_track(batch_inp, fold_by_batch_idx);
+
+        inkling_row_fold.assign(n_outputs, 0);
+        for (size_t i = 0; i < fold_by_batch_idx.size() && i < output_ids.size(); ++i) {
+            const int32_t row = output_ids[i];
+            if (row >= 0 && row < (int32_t) n_outputs) {
+                inkling_row_fold[row] = fold_by_batch_idx[i];
             }
         }
     }
